@@ -13,8 +13,9 @@ The module exposes:
 * :func:`ensure_db` — idempotent factory that creates the schema, applies
   indexes, runs a one-shot JSON import if the ``channels`` table is empty, and
   returns a ready-to-use :class:`ChannelStore` bound to the target file.
-* :class:`ChannelStore` — thread-safe wrapper around ``sqlite3.Connection``
-  with high-level helpers (``list_channels``, ``upsert_from_ingest``, etc.).
+* :class:`ChannelStore` — thread-safe wrapper around an APSW connection (when
+  ``apsw`` is installed) or ``sqlite3.Connection`` with high-level helpers
+  (``list_channels``, ``upsert_from_ingest``, etc.).
 * Small CLI (``python -m features.storage.db`` / ``python -m features.storage.db backup``).
 """
 
@@ -40,8 +41,157 @@ from .normalize import (
     normalize_url,
 )
 
+try:  # Optional faster / more robust SQLite driver.
+    import apsw  # type: ignore
+except Exception:  # ImportError or a broken binary wheel
+    apsw = None  # type: ignore[assignment]
+
 
 logger = logging.getLogger(__name__)
+
+# Set IPTV_DB_DRIVER=sqlite3 to force the stdlib driver even when apsw is installed.
+_APSW_ENABLED = apsw is not None and (
+    os.environ.get("IPTV_DB_DRIVER", "").strip().lower() != "sqlite3"
+)
+
+try:
+    from config import IPTV_CHECK_LEASE_SEC as _CONFIG_CHECK_LEASE_SEC
+except Exception:  # pragma: no cover - config unavailable (odd cwd)
+    try:
+        _CONFIG_CHECK_LEASE_SEC = float(os.environ.get("IPTV_CHECK_LEASE_SEC", "300"))
+    except (TypeError, ValueError):
+        _CONFIG_CHECK_LEASE_SEC = 300.0
+DEFAULT_CHECK_LEASE_SEC = float(_CONFIG_CHECK_LEASE_SEC)
+
+
+class _ApswRow:
+    """Row that behaves like ``sqlite3.Row`` (index, name lookup, ``keys()``)."""
+
+    __slots__ = ("_values", "_names", "_index")
+
+    def __init__(self, names: tuple, index: dict, values: tuple) -> None:
+        self._names = names
+        self._index = index
+        self._values = values
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self._values[self._index[key]]
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def keys(self) -> list:
+        return list(self._names)
+
+    def __repr__(self) -> str:
+        return f"_ApswRow({dict(zip(self._names, self._values))!r})"
+
+
+class _ApswCursor:
+    """Eagerly-fetched result set exposing the small DB-API subset we use."""
+
+    def __init__(self, rows: list, rowcount: int) -> None:
+        self._rows = rows
+        self._pos = 0
+        self.rowcount = rowcount
+
+    def fetchone(self):
+        if self._pos >= len(self._rows):
+            return None
+        row = self._rows[self._pos]
+        self._pos += 1
+        return row
+
+    def fetchall(self) -> list:
+        rows = self._rows[self._pos:]
+        self._pos = len(self._rows)
+        return rows
+
+    def fetchmany(self, size: int = 1) -> list:
+        rows = self._rows[self._pos:self._pos + max(1, int(size))]
+        self._pos += len(rows)
+        return rows
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class _ApswConnection:
+    """Minimal ``sqlite3.Connection``-shaped adapter over ``apsw.Connection``.
+
+    APSW runs in autocommit mode; :meth:`begin_immediate` / :meth:`commit` /
+    :meth:`rollback` give :meth:`ChannelStore.transaction` explicit control.
+    """
+
+    def __init__(self, path: str, busy_timeout_ms: int = 30000) -> None:
+        self._db = apsw.Connection(path)
+        self._db.setbusytimeout(int(busy_timeout_ms))
+
+    def _total_changes(self) -> int:
+        getter = getattr(self._db, "total_changes", None) or self._db.totalchanges
+        return int(getter())
+
+    def _autocommit(self) -> bool:
+        getter = getattr(self._db, "get_autocommit", None) or self._db.getautocommit
+        return bool(getter())
+
+    @staticmethod
+    def _column_names(cursor) -> tuple:
+        getter = getattr(cursor, "get_description", None) or getattr(
+            cursor, "getdescription", None
+        )
+        if getter is None:
+            return ()
+        try:
+            return tuple(d[0] for d in getter())
+        except Exception:  # statement produced no result columns
+            return ()
+
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> _ApswCursor:
+        cursor = self._db.cursor()
+        before = self._total_changes()
+        cursor.execute(sql, tuple(params) if params else None)
+        names = self._column_names(cursor)
+        raw_rows = cursor.fetchall() if names else []
+        if raw_rows and len(raw_rows[0]) != len(names):
+            names = tuple(f"col{i}" for i in range(len(raw_rows[0])))
+        index = {n: i for i, n in enumerate(names)}
+        rows = [_ApswRow(names, index, tuple(r)) for r in raw_rows]
+        return _ApswCursor(rows, self._total_changes() - before)
+
+    def executemany(self, sql: str, seq: Iterable[Sequence[Any]]) -> _ApswCursor:
+        cursor = self._db.cursor()
+        before = self._total_changes()
+        cursor.executemany(sql, (tuple(p) for p in seq))
+        return _ApswCursor([], self._total_changes() - before)
+
+    def begin_immediate(self) -> None:
+        if self._autocommit():
+            self._db.cursor().execute("BEGIN IMMEDIATE")
+
+    def commit(self) -> None:
+        if not self._autocommit():
+            self._db.cursor().execute("COMMIT")
+
+    def rollback(self) -> None:
+        if not self._autocommit():
+            self._db.cursor().execute("ROLLBACK")
+
+    def backup_to(self, dest: str) -> None:
+        target = apsw.Connection(dest)
+        try:
+            with target.backup("main", self._db, "main") as job:
+                job.step()
+        finally:
+            target.close()
+
+    def close(self) -> None:
+        self._db.close()
 
 
 DEFAULT_DB_PATH = os.environ.get("IPTV_DB_PATH", os.path.join("data", "iptv.db"))
@@ -62,9 +212,14 @@ _SORT_COLUMNS = {
     "group": "group_title COLLATE NOCASE",
     "group_title": "group_title COLLATE NOCASE",
     "country": "country COLLATE NOCASE",
+    # "Servers" view: country now reflects where the stream host is located.
+    "server": "country COLLATE NOCASE",
     "status": "status",
     "media_type": "media_type",
     "last_checked_at": "last_checked_at",
+    "last_checked": "last_checked_at",
+    "scanned": "last_checked_at",
+    "recently_scanned": "last_checked_at",
     "updated_at": "updated_at",
     "url": "url",
     "fail_count": "fail_count",
@@ -83,6 +238,16 @@ TREND_HALF_LIFE_HOURS = 6.0
 WATCH_MIN_INTERVAL_SEC = 120.0
 # Drop raw watch events older than this.
 WATCH_PRUNE_DAYS = 30
+# A viewer heartbeat counts as "watching now" for this long.
+VIEWER_ACTIVE_SEC = 45.0
+# Heartbeat rows older than this are deleted (opportunistically + via prune_viewers).
+VIEWER_PRUNE_SEC = 600.0
+# Persisted host→country lookups are re-resolved after this many days.
+HOST_GEO_TTL_DAYS = 30
+# Priority assigned by mark_priority_check (higher = checked sooner).
+DEFAULT_CHECK_PRIORITY = 100
+
+_PLACEHOLDER_COUNTRIES = frozenset({"", "GLOBAL", "XX", "ZZ", "UNKNOWN", "UNDEFINED"})
 
 
 SCHEMA_STATEMENTS: Sequence[str] = (
@@ -110,7 +275,9 @@ SCHEMA_STATEMENTS: Sequence[str] = (
         trend_score       REAL DEFAULT 0,
         watch_count       INTEGER DEFAULT 0,
         last_watched_at   REAL,
-        trend_updated_at  REAL
+        trend_updated_at  REAL,
+        check_priority    INTEGER DEFAULT 0,
+        check_leased_until REAL
     )
     """,
     """
@@ -155,6 +322,20 @@ SCHEMA_STATEMENTS: Sequence[str] = (
         watched_at  REAL NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS channel_viewers (
+        session_id TEXT PRIMARY KEY,
+        url        TEXT NOT NULL,
+        last_seen  REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS host_geo (
+        hostname    TEXT PRIMARY KEY,
+        country     TEXT,
+        resolved_at REAL
+    )
+    """,
 )
 
 INDEX_STATEMENTS: Sequence[str] = (
@@ -171,6 +352,9 @@ INDEX_STATEMENTS: Sequence[str] = (
     "CREATE INDEX IF NOT EXISTS idx_playlist_queue_depth ON playlist_queue(depth)",
     "CREATE INDEX IF NOT EXISTS idx_channel_watches_watched_at ON channel_watches(watched_at)",
     "CREATE INDEX IF NOT EXISTS idx_channel_watches_url ON channel_watches(url)",
+    "CREATE INDEX IF NOT EXISTS idx_channels_check_priority ON channels(check_priority)",
+    "CREATE INDEX IF NOT EXISTS idx_channel_viewers_url ON channel_viewers(url)",
+    "CREATE INDEX IF NOT EXISTS idx_channel_viewers_last_seen ON channel_viewers(last_seen)",
 )
 
 # Columns added to existing DBs via ALTER (CREATE TABLE IF NOT EXISTS won't add them).
@@ -179,6 +363,10 @@ _CHANNEL_COLUMN_MIGRATIONS: Sequence[tuple[str, str]] = (
     ("watch_count", "INTEGER DEFAULT 0"),
     ("last_watched_at", "REAL"),
     ("trend_updated_at", "REAL"),
+    ("check_priority", "INTEGER DEFAULT 0"),
+    ("check_leased_until", "REAL"),
+    ("http_user_agent", "TEXT"),
+    ("http_referrer", "TEXT"),
 )
 
 
@@ -206,6 +394,10 @@ CHANNEL_COLUMNS: tuple = (
     "watch_count",
     "last_watched_at",
     "trend_updated_at",
+    "check_priority",
+    "check_leased_until",
+    "http_user_agent",
+    "http_referrer",
 )
 
 
@@ -247,6 +439,13 @@ def ensure_db(path: Optional[str] = None) -> "ChannelStore":
     except Exception as exc:
         logger.warning("Country/category separation skipped: %s", exc)
 
+    try:
+        fixed = store.reclassify_media_types()
+        if fixed:
+            logger.info("Reclassified media_type on %d channels (HLS loops → live)", fixed)
+    except Exception as exc:
+        logger.warning("media_type reclassify skipped: %s", exc)
+
     with _default_store_lock:
         if path is None or os.path.abspath(db_path) == os.path.abspath(DEFAULT_DB_PATH):
             _default_store = store
@@ -257,24 +456,76 @@ def get_default_store() -> "ChannelStore":
     """Return the process-wide store, creating it on first use."""
     global _default_store
     with _default_store_lock:
-        if _default_store is None:
-            return ensure_db()
-        return _default_store
+        if _default_store is not None:
+            return _default_store
+    # Call ensure_db outside the lock — ensure_db also takes _default_store_lock
+    # (non-reentrant), so nesting would deadlock.
+    return ensure_db()
 
 
 class ChannelStore:
-    """Thread-safe wrapper around a WAL-mode SQLite connection."""
+    """Thread-safe wrapper around a WAL-mode SQLite connection.
+
+    Uses APSW when importable (see :data:`_APSW_ENABLED`), otherwise stdlib
+    ``sqlite3``. Either way rows support ``row[0]``, ``row["col"]`` and
+    ``row.keys()``, and cursors support ``fetchone`` / ``fetchall`` / ``rowcount``.
+    """
 
     def __init__(self, path: str) -> None:
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
-        self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            self._conn.execute("PRAGMA busy_timeout=30000")
+        self._read_lock = threading.RLock()
+        self._tx_depth = 0
+        self._last_viewer_prune = 0.0
+        self._apsw = False
+        self._conn: Any = None
+        self._read_conn: Any = None
+
+        if _APSW_ENABLED:
+            try:
+                conn = _ApswConnection(path, 30000)
+                with self._lock:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                self._conn = conn
+                self._apsw = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("APSW unavailable for %s (%s); using sqlite3", path, exc)
+                self._conn = None
+
+        if self._conn is None:
+            self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+            self._conn.row_factory = sqlite3.Row
+            with self._lock:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                self._conn.execute("PRAGMA busy_timeout=30000")
+
+        # Separate read connection so /channels can answer while ingest/health
+        # hold the write lock (WAL allows concurrent readers).
+        try:
+            if self._apsw:
+                rconn = _ApswConnection(path, 30000)
+                rconn.execute("PRAGMA query_only=ON")
+            else:
+                rconn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+                rconn.row_factory = sqlite3.Row
+                rconn.execute("PRAGMA busy_timeout=30000")
+                try:
+                    rconn.execute("PRAGMA query_only=ON")
+                except sqlite3.Error:
+                    pass
+            self._read_conn = rconn
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("read connection unavailable (%s); reads share write conn", exc)
+            self._read_conn = None
+
+    @property
+    def driver(self) -> str:
+        """Active SQLite driver name: ``"apsw"`` or ``"sqlite3"``."""
+        return "apsw" if self._apsw else "sqlite3"
 
     # ------------------------------------------------------------------ core
 
@@ -282,25 +533,58 @@ class ChannelStore:
         with self._lock:
             with contextlib.suppress(Exception):
                 self._conn.close()
+        with self._read_lock:
+            if self._read_conn is not None:
+                with contextlib.suppress(Exception):
+                    self._read_conn.close()
 
-    def _execute(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
+    def _execute(self, sql: str, params: Sequence[Any] = ()) -> Any:
         with self._lock:
             return self._conn.execute(sql, params)
 
-    def _executemany(self, sql: str, seq: Iterable[Sequence[Any]]) -> sqlite3.Cursor:
+    def _execute_read(self, sql: str, params: Sequence[Any] = ()) -> Any:
+        """Run a read-only query without waiting on the write lock when possible."""
+        if self._read_conn is not None:
+            with self._read_lock:
+                return self._read_conn.execute(sql, params)
+        return self._execute(sql, params)
+
+    def _executemany(self, sql: str, seq: Iterable[Sequence[Any]]) -> Any:
         with self._lock:
             return self._conn.executemany(sql, seq)
 
     @contextlib.contextmanager
-    def transaction(self):
-        """Yield a raw connection guarded by the write lock, committing on exit."""
+    def transaction(self, immediate: bool = False):
+        """Yield a connection guarded by the write lock, committing on exit.
+
+        ``immediate=True`` takes the SQLite write lock up front (``BEGIN
+        IMMEDIATE``) so a read-then-write sequence is atomic across processes.
+        APSW always begins immediately. Nested calls join the outer transaction.
+        """
         with self._lock:
+            if self._tx_depth > 0:
+                self._tx_depth += 1
+                try:
+                    yield self._conn
+                finally:
+                    self._tx_depth -= 1
+                return
+
+            if self._apsw:
+                self._conn.begin_immediate()
+            elif immediate:
+                if self._conn.in_transaction:
+                    self._conn.commit()
+                self._conn.execute("BEGIN IMMEDIATE")
+            self._tx_depth = 1
             try:
                 yield self._conn
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
+            finally:
+                self._tx_depth = 0
 
     def _init_schema(self) -> None:
         with self.transaction() as conn:
@@ -343,7 +627,7 @@ class ChannelStore:
         return new_value
 
     def get_revision(self) -> int:
-        row = self._execute(
+        row = self._execute_read(
             "SELECT value FROM meta WHERE key = 'revision'"
         ).fetchone()
         try:
@@ -352,7 +636,7 @@ class ChannelStore:
             return 0
 
     def get_meta(self, key: str, default: Optional[str] = None) -> Optional[str]:
-        row = self._execute(
+        row = self._execute_read(
             "SELECT value FROM meta WHERE key = ?", (key,)
         ).fetchone()
         return row[0] if row and row[0] is not None else default
@@ -386,8 +670,22 @@ class ChannelStore:
         sql = "SELECT COUNT(*) FROM channels"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        row = self._execute(sql, params).fetchone()
+        row = self._execute_read(sql, params).fetchone()
         return int(row[0]) if row else 0
+
+    def status_counts(self, *, exclude_test: bool = True) -> dict:
+        """One-query ``{status: count}`` for every valid status (0 when absent)."""
+        sql = "SELECT status, COUNT(*) FROM channels"
+        if exclude_test:
+            sql += " WHERE (group_title IS NULL OR group_title != 'Test')"
+        sql += " GROUP BY status"
+        counts = {s: 0 for s in ("online", "pending", "unknown", "offline", "error")}
+        for row in self._execute_read(sql).fetchall():
+            key = (row[0] or "unknown").lower()
+            if key not in counts:
+                key = "unknown"
+            counts[key] += int(row[1])
+        return counts
 
     def count_check_queue(
         self,
@@ -404,7 +702,7 @@ class ChannelStore:
         if exclude_test:
             clauses.append("(group_title IS NULL OR group_title != 'Test')")
         sql = "SELECT COUNT(*) FROM channels WHERE " + " AND ".join(clauses)
-        row = self._execute(sql, params).fetchone()
+        row = self._execute_read(sql, params).fetchone()
         return int(row[0]) if row else 0
 
     def count_priority_checks(
@@ -424,7 +722,7 @@ class ChannelStore:
         if exclude_test:
             clauses.append("(group_title IS NULL OR group_title != 'Test')")
         sql = "SELECT COUNT(*) FROM channels WHERE " + " AND ".join(clauses)
-        row = self._execute(sql, params).fetchone()
+        row = self._execute_read(sql, params).fetchone()
         return int(row[0]) if row else 0
 
     def list_channels(
@@ -452,6 +750,28 @@ class ChannelStore:
         except (TypeError, ValueError):
             limit = 50
 
+        def _split_filter_values(value) -> list[str]:
+            """One value, comma-list, or sequence → de-duplicated strings."""
+            if value is None:
+                return []
+            if isinstance(value, (list, tuple, set)):
+                raw_items = list(value)
+            else:
+                raw_items = [value]
+            out: list[str] = []
+            seen: set[str] = set()
+            for item in raw_items:
+                for part in str(item).split(","):
+                    s = part.strip()
+                    if not s:
+                        continue
+                    key = s.casefold()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(s)
+            return out
+
         clauses: list = []
         params: list = []
         if q:
@@ -461,25 +781,37 @@ class ChannelStore:
                 " OR LOWER(country) LIKE ? OR LOWER(url) LIKE ?)"
             )
             params.extend([like, like, like, like])
-        if group:
+        group_list = _split_filter_values(group)
+        if len(group_list) == 1:
             clauses.append("group_title = ?")
-            params.append(group)
-        if country:
+            params.append(group_list[0])
+        elif group_list:
+            placeholders = ",".join("?" for _ in group_list)
+            clauses.append(f"group_title IN ({placeholders})")
+            params.extend(group_list)
+        country_list = _split_filter_values(country)
+        if country_list:
             from .geo import country_code_to_name, country_name_to_code
 
-            # Accept ISO code or English name from the UI.
-            code = country_name_to_code(country) or (
-                country.strip().upper() if len(country.strip()) == 2 else country.strip().upper()
-            )
-            name = country_code_to_name(code) or country.strip()
-            # Many playlists put the country in group-title and leave country blank/GLOBAL.
-            clauses.append(
-                "("
-                " UPPER(COALESCE(country, '')) = ?"
-                " OR LOWER(COALESCE(group_title, '')) = LOWER(?)"
-                ")"
-            )
-            params.extend([code, name])
+            country_parts: list[str] = []
+            for raw in country_list:
+                # Accept ISO code or English name from the UI.
+                code = country_name_to_code(raw) or (
+                    raw.strip().upper() if len(raw.strip()) == 2 else raw.strip().upper()
+                )
+                name = country_code_to_name(code) or raw.strip()
+                # Many playlists put the country in group-title and leave country blank/GLOBAL.
+                country_parts.append(
+                    "("
+                    " UPPER(COALESCE(country, '')) = ?"
+                    " OR LOWER(COALESCE(group_title, '')) = LOWER(?)"
+                    ")"
+                )
+                params.extend([code, name])
+            if len(country_parts) == 1:
+                clauses.append(country_parts[0])
+            else:
+                clauses.append("(" + " OR ".join(country_parts) + ")")
         if online_only:
             clauses.append("status = 'online'")
         elif status_in:
@@ -504,7 +836,7 @@ class ChannelStore:
         if clauses:
             where = " WHERE " + " AND ".join(clauses)
 
-        total_row = self._execute(
+        total_row = self._execute_read(
             f"SELECT COUNT(*) FROM channels{where}", params
         ).fetchone()
         total = int(total_row[0]) if total_row else 0
@@ -519,6 +851,12 @@ class ChannelStore:
                 f" COALESCE(last_watched_at, 0) DESC,"
                 f" name COLLATE NOCASE ASC, url ASC"
             )
+        elif sort_key in ("last_checked_at", "last_checked", "scanned", "recently_scanned"):
+            # Never-checked rows (NULL) always last when sorting by scan time.
+            order_clause = (
+                f" ORDER BY (last_checked_at IS NULL) ASC,"
+                f" last_checked_at {direction}, name COLLATE NOCASE ASC, url ASC"
+            )
         else:
             order_clause = f" ORDER BY {order_col} {direction}, url ASC"
 
@@ -526,10 +864,10 @@ class ChannelStore:
         query_sql = (
             f"SELECT * FROM channels{where}{order_clause} LIMIT ? OFFSET ?"
         )
-        rows = self._execute(query_sql, (*params, limit, offset)).fetchall()
+        rows = self._execute_read(query_sql, (*params, limit, offset)).fetchall()
         channels = [coerce_dict(r) for r in rows]
 
-        groups_rows = self._execute(
+        groups_rows = self._execute_read(
             "SELECT group_title, COUNT(*) FROM channels"
             " WHERE group_title IS NOT NULL AND group_title != ''"
             " GROUP BY group_title ORDER BY group_title COLLATE NOCASE"
@@ -543,7 +881,7 @@ class ChannelStore:
             if not is_country_like_group(r[0])
         ]
 
-        countries_rows = self._execute(
+        countries_rows = self._execute_read(
             "SELECT country, COUNT(*) FROM channels"
             " WHERE country IS NOT NULL AND country != ''"
             " AND UPPER(country) NOT IN ('GLOBAL', 'XX', 'ZZ', 'UNKNOWN', 'UNDEFINED')"
@@ -607,12 +945,12 @@ class ChannelStore:
             + " AND ".join(clauses)
             + " ORDER BY name COLLATE NOCASE"
         )
-        rows = self._execute(sql).fetchall()
+        rows = self._execute_read(sql).fetchall()
         return [coerce_dict(r) for r in rows]
 
     def get_export_channels(self) -> list:
         """Return every online channel, including Test entries — for M3U export."""
-        rows = self._execute(
+        rows = self._execute_read(
             "SELECT * FROM channels WHERE status = 'online'"
             " ORDER BY name COLLATE NOCASE"
         ).fetchall()
@@ -621,14 +959,14 @@ class ChannelStore:
     def get_channel(self, url: str) -> Optional[dict]:
         if not url:
             return None
-        row = self._execute(
+        row = self._execute_read(
             "SELECT * FROM channels WHERE url = ?", (url,)
         ).fetchone()
         return coerce_dict(row) if row else None
 
     def get_master_map(self) -> dict:
         """Return ``{url: channel_dict}`` used to merge with the legacy master cache."""
-        rows = self._execute("SELECT * FROM channels").fetchall()
+        rows = self._execute_read("SELECT * FROM channels").fetchall()
         return {r["url"]: coerce_dict(r) for r in rows}
 
     # -------------------------------------------------------------- checker
@@ -637,11 +975,19 @@ class ChannelStore:
         self,
         statuses: Sequence[str],
         limit: int,
+        lease_sec: Optional[float] = None,
     ) -> list:
-        """Return channels ready to be re-checked, oldest ``last_checked_at`` first.
+        """Atomically lease and return channels ready to be re-checked.
 
-        Rows that were never checked (``last_checked_at IS NULL``) come first so
-        newly ingested channels get a status quickly.
+        Order: highest ``check_priority`` first, then never-checked rows, then
+        oldest ``last_checked_at``. Rows whose ``check_leased_until`` is still in
+        the future are skipped; every returned row is leased for ``lease_sec``
+        (default :data:`DEFAULT_CHECK_LEASE_SEC`) so concurrent workers never get
+        the same row. The lease is cleared by :meth:`update_channel_results`, or
+        simply expires if the worker dies.
+
+        Implemented as SELECT + UPDATE inside one ``BEGIN IMMEDIATE`` transaction
+        (works on any SQLite version, no ``RETURNING`` needed).
         """
         if not statuses:
             return []
@@ -649,14 +995,32 @@ class ChannelStore:
             limit = max(1, int(limit))
         except (TypeError, ValueError):
             limit = 50
+        try:
+            lease = float(DEFAULT_CHECK_LEASE_SEC if lease_sec is None else lease_sec)
+        except (TypeError, ValueError):
+            lease = DEFAULT_CHECK_LEASE_SEC
+
         placeholders = ",".join("?" for _ in statuses)
         sql = (
             f"SELECT * FROM channels WHERE status IN ({placeholders})"
-            " ORDER BY (last_checked_at IS NULL) DESC, last_checked_at ASC, url ASC"
+            " AND (check_leased_until IS NULL OR check_leased_until <= ?)"
+            " ORDER BY COALESCE(check_priority, 0) DESC,"
+            " (last_checked_at IS NULL) DESC, last_checked_at ASC, url ASC"
             " LIMIT ?"
         )
-        rows = self._execute(sql, (*statuses, limit)).fetchall()
-        return [coerce_dict(r) for r in rows]
+        now = time.time()
+        lease_until = now + lease
+        with self.transaction(immediate=True) as conn:
+            rows = conn.execute(sql, (*statuses, now, limit)).fetchall()
+            claimed = [coerce_dict(r) for r in rows]
+            if claimed and lease > 0:
+                conn.executemany(
+                    "UPDATE channels SET check_leased_until = ? WHERE url = ?",
+                    [(lease_until, ch["url"]) for ch in claimed],
+                )
+                for ch in claimed:
+                    ch["check_leased_until"] = lease_until
+        return claimed
 
     def claim_active_batch(
         self,
@@ -674,22 +1038,35 @@ class ChannelStore:
         """Claim offline/error channels for the dead-revival worker."""
         return self.claim_check_batch(statuses or DEAD_STATUSES, limit)
 
-    def mark_priority_check(self, url: str) -> bool:
-        """Force ``url`` to the front of the health queue (unchecked-first).
+    def mark_priority_check(
+        self,
+        url: str,
+        priority: int = DEFAULT_CHECK_PRIORITY,
+    ) -> bool:
+        """Force ``url`` to the front of the health queue.
 
-        Clears ``last_checked_at`` so :meth:`claim_check_batch` picks it up
-        before already-scanned rows. Used when a client reports a stream from
-        the unchecked/dead directory actually played.
+        Sets ``check_priority`` (claimed highest-first) and clears
+        ``last_checked_at`` so :meth:`claim_check_batch` picks it up before
+        already-scanned rows. Used when a client reports a stream from the
+        unchecked/dead directory actually played. Priority is reset to 0 by
+        :meth:`update_channel_results` once the check lands.
         """
         url = (url or "").strip()
         if not url:
             return False
+        try:
+            priority = int(priority)
+        except (TypeError, ValueError):
+            priority = DEFAULT_CHECK_PRIORITY
         now = time.time()
-        cur = self._execute(
-            "UPDATE channels SET last_checked_at = NULL, updated_at = ? WHERE url = ?",
-            (now, url),
-        )
-        if cur.rowcount:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE channels SET check_priority = ?, last_checked_at = NULL,"
+                " updated_at = ? WHERE url = ?",
+                (priority, now, url),
+            )
+            changed = cur.rowcount
+        if changed:
             self.bump_revision()
             return True
         return False
@@ -726,7 +1103,13 @@ class ChannelStore:
                 fail_delta = result.get("fail_delta")
                 explicit_fail_count = result.get("fail_count")
 
-                assignments = ["status = ?", "updated_at = ?", "last_checked_at = ?"]
+                assignments = [
+                    "status = ?",
+                    "updated_at = ?",
+                    "last_checked_at = ?",
+                    "check_priority = 0",
+                    "check_leased_until = NULL",
+                ]
                 params: list = [status, now, now]
 
                 if playing_now is not None:
@@ -758,6 +1141,41 @@ class ChannelStore:
         if rows_written:
             self.bump_revision()
         return rows_written
+
+    def reclassify_media_types(self, *, limit: int = 5000) -> int:
+        """Fix false ``vod`` tags (e.g. ``.mov`` matching ``mov3.co`` hosts).
+
+        HLS/DASH URLs and live YouTube/Twitch links become ``live``. Progressive
+        files stay ``vod``. Idempotent.
+        """
+        from .normalize import classify_media_type
+
+        rows = self._execute(
+            "SELECT url, media_type FROM channels"
+            " WHERE media_type IS NULL OR media_type IN ('', 'unknown', 'vod')"
+            " LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+        if not rows:
+            return 0
+
+        fixed = 0
+        now = time.time()
+        with self.transaction() as conn:
+            for row in rows:
+                url = row["url"] if hasattr(row, "keys") else row[0]
+                prev = (row["media_type"] if hasattr(row, "keys") else row[1]) or ""
+                new = classify_media_type(url)
+                if new == "unknown" or new == (prev or "").lower():
+                    continue
+                cur = conn.execute(
+                    "UPDATE channels SET media_type = ?, updated_at = ? WHERE url = ?",
+                    (new, now, url),
+                )
+                fixed += int(cur.rowcount or 0)
+        if fixed:
+            self.bump_revision()
+        return fixed
 
     def separate_country_groups(self) -> int:
         """Peel country/region names out of ``group_title`` into ``country``.
@@ -939,6 +1357,172 @@ class ChannelStore:
             )
             return int(cur.rowcount or 0)
 
+    # -------------------------------------------------------------- viewers
+
+    def heartbeat_viewer(self, session_id: str, url: str) -> bool:
+        """Record that ``session_id`` is watching ``url`` right now.
+
+        One row per session: switching channels simply moves the row. Stale
+        rows are pruned opportunistically (about once a minute).
+        """
+        session_id = (session_id or "").strip()[:128]
+        url = (url or "").strip()
+        if not session_id or not url:
+            return False
+        now = time.time()
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO channel_viewers(session_id, url, last_seen) VALUES (?, ?, ?)"
+                " ON CONFLICT(session_id) DO UPDATE SET"
+                " url = excluded.url, last_seen = excluded.last_seen",
+                (session_id, url, now),
+            )
+            if now - self._last_viewer_prune >= 60.0:
+                self._last_viewer_prune = now
+                conn.execute(
+                    "DELETE FROM channel_viewers WHERE last_seen < ?",
+                    (now - VIEWER_PRUNE_SEC,),
+                )
+        return True
+
+    def count_viewers(self, url: str, max_age: float = VIEWER_ACTIVE_SEC) -> int:
+        """Sessions with a heartbeat for ``url`` within the last ``max_age`` seconds."""
+        url = (url or "").strip()
+        if not url:
+            return 0
+        row = self._execute(
+            "SELECT COUNT(*) FROM channel_viewers WHERE url = ? AND last_seen >= ?",
+            (url, time.time() - float(max_age)),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def prune_viewers(self, max_age: float = VIEWER_PRUNE_SEC) -> int:
+        """Delete heartbeats older than ``max_age`` seconds; returns rows removed."""
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM channel_viewers WHERE last_seen < ?",
+                (time.time() - float(max_age),),
+            )
+            return int(cur.rowcount or 0)
+
+    def viewer_counts_for_urls(
+        self,
+        urls: Iterable[str],
+        max_age: float = VIEWER_ACTIVE_SEC,
+    ) -> dict:
+        """Return ``{url: active_viewers}`` for every url in ``urls`` (0 when none)."""
+        wanted: list = []
+        seen: set = set()
+        for u in urls or ():
+            if isinstance(u, str):
+                u = u.strip()
+                if u and u not in seen:
+                    seen.add(u)
+                    wanted.append(u)
+        counts = {u: 0 for u in wanted}
+        if not wanted:
+            return counts
+        cutoff = time.time() - float(max_age)
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._execute(
+                "SELECT url, COUNT(*) FROM channel_viewers"
+                f" WHERE last_seen >= ? AND url IN ({placeholders}) GROUP BY url",
+                (cutoff, *chunk),
+            ).fetchall()
+            for r in rows:
+                counts[r[0]] = int(r[1])
+        return counts
+
+    # ------------------------------------------------------------- host geo
+
+    def get_host_country(self, hostname: str) -> Optional[str]:
+        """Cached country for ``hostname`` (``None`` if unknown or stale)."""
+        host = (hostname or "").strip().lower()
+        if not host:
+            return None
+        row = self._execute(
+            "SELECT country, resolved_at FROM host_geo WHERE hostname = ?",
+            (host,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        resolved_at = row[1]
+        if resolved_at is not None and (
+            time.time() - float(resolved_at) > HOST_GEO_TTL_DAYS * 86400.0
+        ):
+            return None
+        return str(row[0])
+
+    def set_host_country(self, hostname: str, country: str) -> None:
+        host = (hostname or "").strip().lower()
+        code = (country or "").strip().upper()
+        if not host or not code:
+            return
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO host_geo(hostname, country, resolved_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(hostname) DO UPDATE SET"
+                " country = excluded.country, resolved_at = excluded.resolved_at",
+                (host, code, time.time()),
+            )
+
+    def backfill_server_countries(self, limit: int = 25) -> int:
+        """Geolocate stream hosts for channels whose country is blank / GLOBAL.
+
+        Walks ``url`` order using a persisted cursor (``meta.geo_backfill_cursor``)
+        so unresolvable rows do not starve the rest, wrapping around when done.
+        Network lookups happen outside the DB lock and honour the geo rate limit
+        (this call may therefore block for a while). Returns rows updated.
+        """
+        from .geo import is_placeholder_country, resolve_server_country_from_url
+
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit = 25
+
+        cursor_url = self.get_meta("geo_backfill_cursor", "") or ""
+        sql = (
+            "SELECT url FROM channels WHERE url > ?"
+            " AND (country IS NULL OR TRIM(country) = ''"
+            "   OR UPPER(country) IN ('GLOBAL','XX','ZZ','UNKNOWN','UNDEFINED'))"
+            " ORDER BY url LIMIT ?"
+        )
+        rows = self._execute(sql, (cursor_url, limit)).fetchall()
+        if not rows:
+            if cursor_url:
+                self.set_meta("geo_backfill_cursor", "")
+            return 0
+
+        updates: list = []
+        for row in rows:
+            url = row[0]
+            try:
+                code = resolve_server_country_from_url(url, block=True, store=self)
+            except Exception:  # noqa: BLE001
+                logger.debug("host geo failed for %s", url, exc_info=True)
+                code = None
+            if code and not is_placeholder_country(code):
+                updates.append((code, url))
+
+        updated = 0
+        now = time.time()
+        with self.transaction() as conn:
+            for code, url in updates:
+                cur = conn.execute(
+                    "UPDATE channels SET country = ?, updated_at = ? WHERE url = ?"
+                    " AND (country IS NULL OR TRIM(country) = ''"
+                    "   OR UPPER(country) IN ('GLOBAL','XX','ZZ','UNKNOWN','UNDEFINED'))",
+                    (code, now, url),
+                )
+                updated += int(cur.rowcount or 0)
+        self.set_meta("geo_backfill_cursor", rows[-1][0])
+        if updated:
+            self.bump_revision()
+        return updated
+
     # --------------------------------------------------------------- ingest
 
     def upsert_from_ingest(self, channels: Sequence[dict]) -> dict:
@@ -950,6 +1534,8 @@ class ChannelStore:
         * Existing rows keep their status; only descriptive metadata is updated
           (name, tvg_id, tvg_logo, group_title, country, ...).
         * Normalization helpers are always applied before writing.
+        * Commits in chunks so the UI / health workers can interleave reads and
+          claims instead of waiting on one multi-minute write lock.
 
         Returns a summary dict: ``{new, updated, skipped}``.
         """
@@ -957,103 +1543,122 @@ class ChannelStore:
         if not channels:
             return summary
 
+        chunk_size = 200
         now = time.time()
-        with self.transaction() as conn:
-            for raw in channels:
-                if not isinstance(raw, dict):
-                    summary["skipped"] += 1
-                    continue
-                ch = dict(raw)
-                url = (ch.get("url") or "").strip()
-                if not url:
-                    summary["skipped"] += 1
-                    continue
-                ch["url"] = url
-                normalize_channel(ch)
-                url_norm = ch.get("url_norm") or normalize_url(url)
+        items = list(channels)
 
-                existing = conn.execute(
-                    "SELECT url FROM channels WHERE url = ?"
-                    " UNION ALL SELECT url FROM channels WHERE url_norm = ?"
-                    " LIMIT 1",
-                    (url, url_norm),
-                ).fetchone()
+        for start in range(0, len(items), chunk_size):
+            chunk = items[start : start + chunk_size]
+            with self.transaction() as conn:
+                for raw in chunk:
+                    if not isinstance(raw, dict):
+                        summary["skipped"] += 1
+                        continue
+                    ch = dict(raw)
+                    url = (ch.get("url") or "").strip()
+                    if not url:
+                        summary["skipped"] += 1
+                        continue
+                    ch["url"] = url
+                    normalize_channel(ch)
+                    url_norm = ch.get("url_norm") or normalize_url(url)
 
-                if existing:
-                    target_url = existing[0]
-                    updates: list = []
-                    params: list = []
-                    for column in (
-                        "name",
-                        "tvg_id",
-                        "tvg_logo",
-                        "group_title",
-                        "country",
-                        "icon_url",
-                        "audio_language",
-                        "variant_of",
-                        "variant_quality",
-                        "variant_bandwidth",
-                    ):
-                        val = ch.get(column)
-                        if val not in (None, ""):
-                            updates.append(f"{column} = ?")
-                            params.append(val)
+                    existing = conn.execute(
+                        "SELECT url FROM channels WHERE url = ?"
+                        " UNION ALL SELECT url FROM channels WHERE url_norm = ?"
+                        " LIMIT 1",
+                        (url, url_norm),
+                    ).fetchone()
 
-                    media_type = ch.get("media_type")
-                    if media_type and media_type in VALID_MEDIA_TYPES and media_type != "unknown":
-                        updates.append("media_type = COALESCE(NULLIF(media_type, 'unknown'), ?)")
-                        params.append(media_type)
+                    if existing:
+                        target_url = existing[0]
+                        updates: list = []
+                        params: list = []
+                        for column in (
+                            "name",
+                            "tvg_id",
+                            "tvg_logo",
+                            "group_title",
+                            "country",
+                            "icon_url",
+                            "audio_language",
+                            "variant_of",
+                            "variant_quality",
+                            "variant_bandwidth",
+                            "http_user_agent",
+                            "http_referrer",
+                        ):
+                            val = ch.get(column)
+                            if column == "country" and (
+                                str(val or "").strip().upper() in _PLACEHOLDER_COUNTRIES
+                            ):
+                                # Never downgrade a known (host-geo) country to GLOBAL.
+                                continue
+                            if val not in (None, ""):
+                                updates.append(f"{column} = ?")
+                                params.append(val)
 
-                    if url_norm:
-                        updates.append("url_norm = COALESCE(url_norm, ?)")
-                        params.append(url_norm)
+                        media_type = ch.get("media_type")
+                        if media_type and media_type in VALID_MEDIA_TYPES and media_type != "unknown":
+                            updates.append(
+                                "media_type = COALESCE(NULLIF(media_type, 'unknown'), ?)"
+                            )
+                            params.append(media_type)
 
-                    updates.append("updated_at = ?")
-                    params.append(now)
+                        if url_norm:
+                            updates.append("url_norm = COALESCE(url_norm, ?)")
+                            params.append(url_norm)
 
-                    params.append(target_url)
+                        updates.append("updated_at = ?")
+                        params.append(now)
+
+                        params.append(target_url)
+                        conn.execute(
+                            f"UPDATE channels SET {', '.join(updates)} WHERE url = ?",
+                            params,
+                        )
+                        summary["updated"] += 1
+                        continue
+
+                    media_type = ch.get("media_type") or classify_media_type(url)
+                    if media_type not in VALID_MEDIA_TYPES:
+                        media_type = "unknown"
+
                     conn.execute(
-                        f"UPDATE channels SET {', '.join(updates)} WHERE url = ?",
-                        params,
+                        "INSERT INTO channels ("
+                        " url, url_norm, name, tvg_id, tvg_logo, group_title,"
+                        " playing_now, status, country, icon_url, audio_language,"
+                        " variant_of, media_type, fail_reason, fail_count,"
+                        " last_checked_at, updated_at, variant_quality, variant_bandwidth,"
+                        " http_user_agent, http_referrer"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            url,
+                            url_norm,
+                            ch.get("name"),
+                            ch.get("tvg_id"),
+                            ch.get("tvg_logo"),
+                            ch.get("group_title"),
+                            ch.get("playing_now"),
+                            "pending",
+                            ch.get("country"),
+                            ch.get("icon_url"),
+                            ch.get("audio_language"),
+                            ch.get("variant_of"),
+                            media_type,
+                            None,
+                            0,
+                            None,
+                            now,
+                            ch.get("variant_quality"),
+                            ch.get("variant_bandwidth"),
+                            ch.get("http_user_agent"),
+                            ch.get("http_referrer"),
+                        ),
                     )
-                    summary["updated"] += 1
-                    continue
-
-                media_type = ch.get("media_type") or classify_media_type(url)
-                if media_type not in VALID_MEDIA_TYPES:
-                    media_type = "unknown"
-
-                conn.execute(
-                    "INSERT INTO channels ("
-                    " url, url_norm, name, tvg_id, tvg_logo, group_title,"
-                    " playing_now, status, country, icon_url, audio_language,"
-                    " variant_of, media_type, fail_reason, fail_count,"
-                    " last_checked_at, updated_at, variant_quality, variant_bandwidth"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        url,
-                        url_norm,
-                        ch.get("name"),
-                        ch.get("tvg_id"),
-                        ch.get("tvg_logo"),
-                        ch.get("group_title"),
-                        ch.get("playing_now"),
-                        "pending",
-                        ch.get("country"),
-                        ch.get("icon_url"),
-                        ch.get("audio_language"),
-                        ch.get("variant_of"),
-                        media_type,
-                        None,
-                        0,
-                        None,
-                        now,
-                        ch.get("variant_quality"),
-                        ch.get("variant_bandwidth"),
-                    ),
-                )
-                summary["new"] += 1
+                    summary["new"] += 1
+            # Yield the write lock between chunks so Waitress can serve /channels.
+            time.sleep(0.01)
 
         if summary["new"] or summary["updated"]:
             self.bump_revision()
@@ -1230,6 +1835,66 @@ class ChannelStore:
                 )
         return [coerce_dict(r) for r in rows]
 
+    # ---------------------------------------------------------------- purge
+
+    def purge_catalog(
+        self,
+        *,
+        keep_host_geo: bool = True,
+        vacuum: bool = True,
+    ) -> dict:
+        """Wipe channel catalog and related tables so ingest can rebuild fresh.
+
+        Clears channels, variants, watches, viewers, SEO slugs, playlist queue,
+        and invalid-link denylist. Meta ``revision`` is reset to 0 and bumped.
+        Host→country cache is kept by default (safe to reuse across rescans).
+
+        Returns a summary of deleted row counts.
+        """
+        tables = (
+            "channel_viewers",
+            "channel_watches",
+            "channel_variants",
+            "seo_slugs",
+            "playlist_queue",
+            "invalid_links",
+            "channels",
+        )
+        deleted: dict[str, int] = {}
+        with self.transaction() as conn:
+            for table in tables:
+                before = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                count_before = int(before[0]) if before else 0
+                conn.execute(f"DELETE FROM {table}")
+                deleted[table] = count_before
+            if not keep_host_geo:
+                before = conn.execute("SELECT COUNT(*) FROM host_geo").fetchone()
+                deleted["host_geo"] = int(before[0]) if before else 0
+                conn.execute("DELETE FROM host_geo")
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('revision', '0')"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            )
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('purged_at', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(time.time()),),
+            )
+            # Drop ingest cursors so geo-backfill starts over cleanly.
+            for key in ("geo_backfill_cursor",):
+                conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+        self.bump_revision()
+        if vacuum:
+            try:
+                # VACUUM cannot run inside a transaction; best-effort reclaim.
+                with self._lock:
+                    self._conn.execute("VACUUM")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("VACUUM after purge skipped: %s", exc)
+        deleted["revision"] = self.get_revision()
+        return deleted
+
     # ---------------------------------------------------------------- backup
 
     def backup(self, dest: Optional[str] = None) -> str:
@@ -1248,6 +1913,9 @@ class ChannelStore:
                 os.makedirs(parent, exist_ok=True)
 
         with self._lock:
+            if self._apsw:
+                self._conn.backup_to(dest)
+                return dest
             try:
                 target = sqlite3.connect(dest)
                 try:
@@ -1460,6 +2128,18 @@ def _cli(argv: Sequence[str]) -> int:
             store.close()
         return 0
 
+    if command in ("purge", "reset"):
+        store = ensure_db()
+        try:
+            before = store.count_channels(exclude_test=False)
+            summary = store.purge_catalog()
+            print(f"Purged catalog at {store.path}")
+            print(f"  channels removed : {summary.get('channels', before)}")
+            print(f"  revision         : {summary.get('revision')}")
+        finally:
+            store.close()
+        return 0
+
     if command in ("stats", "info"):
         store = ensure_db()
         try:
@@ -1477,7 +2157,10 @@ def _cli(argv: Sequence[str]) -> int:
             store.close()
         return 0
 
-    print(f"Unknown command: {command}. Use 'ensure' or 'backup'.", file=sys.stderr)
+    print(
+        f"Unknown command: {command}. Use 'ensure', 'backup', 'purge', or 'stats'.",
+        file=sys.stderr,
+    )
     return 2
 
 

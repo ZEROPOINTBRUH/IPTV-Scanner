@@ -1,193 +1,118 @@
-## Try for yourself
-> https://iptv.bbyte.app/
-
-
 # IPTV Scanner
 
-**IPTV channel scanner.**
+Live TV guide and channel scanner. Scrapes public IPTV playlists, stores them in **SQLite**, health-checks streams in the background, and serves a Roku-style web guide plus a public channels API.
 
-IPTV Scanner is a powerful tool designed to scan, validate, and organize live TV channels from multiple sources including [iptv-org](https://github.com/iptv-org/iptv) and [Free-TV](https://github.com/Free-TV/IPTV). It features automatic channel validation, categorization, and a modern web interface for easy access to working streams.
+Live demo: https://iptv.bbyte.app/
 
-![](https://i.imgur.com/Vdf5PGY.gif)
+## Requirements
 
-## 🌟 Key Features
+- Python 3.10+ (3.12+ recommended for optional FastWorker)
+- pip
 
-- **📺 Massive Channel Library**: Access 5000+ channels from IPTV-org and 500+ curated channels from Free-TV
-- **🔍 Research-Verified Sources**: Only includes publicly accessible, working streams
-- **🎯 Jellyfin Compatible**: Uses the same sources as Jellyfin media servers
-- **🌍 Global Coverage**: Channels from 30+ countries across all continents
-- **📂 Category Organization**: News, Entertainment, Sports, Documentary, Music, Religious, and more
-- **🔄 Automatic Validation**: Checks stream availability every 3 hours
-- **🎨 Modern Web Interface**: Clean, responsive GUI with search and filtering
-- **⚡ Real-time Updates**: Live channel status monitoring
-- **📱 Mobile Friendly**: Works on all devices and screen sizes
+## Quick start
 
-## 🚀 Installation
+```bash
+git clone https://github.com/ZEROPOINTBRUH/iptv-scanner.git
+cd iptv-scanner
+pip install -r requirements.txt
+python main.py
+```
 
-### Prerequisites
-- Python 3.6 or higher
-- pip package manager
+On a TTY, startup asks whether to **continue** with the existing catalog or **purge and fetch fresh** sources. It waits **30s** then auto-selects **[1] Continue** (set `IPTV_STARTUP_MENU_TIMEOUT_SEC=0` to disable). Non-interactive options:
 
-### Quick Setup
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/ZEROPOINTBRUH/iptv-scanner.git
-   cd iptv-scanner
-   ```
+```bash
+python main.py --fresh --yes          # wipe catalog, then ingest
+IPTV_STARTUP_PURGE=1 python main.py   # same via env
+python -m features.storage.db purge   # wipe only (no server)
+```
 
-2. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+While the app is running: **More → Purge** requires `IPTV_ADMIN_PASSWORD` (falls back to `IPTV_PLAYLIST_SECRET`). Example:
 
-3. **Run the scanner:**
-   ```bash
-   python main.py
-   ```
+```bash
+curl -sS -X POST http://127.0.0.1:40006/admin/purge \
+  -H "Content-Type: application/json" \
+  -d '{"confirm":"purge","password":"YOUR_PASSWORD"}'
+```
 
-4. **Access the web interface:**
-   ```
-   http://127.0.0.1:40006
-   ```
+HTTP purge is **disabled** until a password is set. Attempts are rate-limited; a successful wipe starts a cooldown.
 
-## 📋 Requirements
+Open http://127.0.0.1:40006
 
-The application requires the following Python packages (automatically installed via requirements.txt):
+The app serves with **Waitress** when installed (falls back to Flask’s dev server). Catalog data lives in `data/iptv.db` (override with `IPTV_DB_PATH`).
 
-- `requests` - HTTP library for API calls
-- `flask` - Web framework for the GUI
-- `flask-cors` - Cross-origin resource sharing
-- `m3u8` - M3U playlist parsing
-- `beautifulsoup4` - HTML parsing
-- `aiohttp` - Async HTTP client
-- `yt-dlp` - YouTube stream extraction
-- `pathlib` - Modern file path handling
-- `asyncio` - Async programming support
+## Architecture
 
-## 🌐 Source Integration
+```
+Sources (iptv-org / Free-TV / regional M3Us / playlists.txt)
+        → ingest (pending rows, host-geo “Servers”)
+        → active health + dead revival (+ client priority signals)
+        → SQLite ChannelStore
+        → Flask + Waitress → guide UI / M3U / JSON API / SEO
+```
 
-### Primary Sources
-- **[IPTV-org](https://github.com/iptv-org/iptv)**: Main playlist with 5000+ channels
-- **[Free-TV](https://github.com/Free-TV/IPTV)**: Curated quality playlist (500+ channels)
+## Public API (no key)
 
-### Categories Available
-- 📰 **News**: CNN, BBC, Al Jazeera, Fox News, etc.
-- 🎬 **Entertainment**: Movies, TV shows, series
-- ⚽ **Sports**: ESPN, Fox Sports, EuroSport, etc.
-- 📚 **Documentary**: Discovery, National Geographic, History
-- 🎵 **Music**: MTV, music channels worldwide
-- ⛪ **Religious**: Various religious and spiritual channels
+Canonical catalog (reads SQLite live — not a static fake JSON file):
 
-### Regional Coverage
-- **Americas**: USA, Canada, Mexico, Brazil, Argentina, Colombia, Chile, Peru
-- **Europe**: UK, Germany, France, Italy, Spain
-- **Asia**: India, Japan, South Korea, Thailand, Vietnam, Philippines, Malaysia, Singapore, Indonesia
-- **Middle East & Africa**: Egypt, Turkey, Saudi Arabia, South Africa
-- **Oceania**: Australia, New Zealand
+| Style | URL |
+|-------|-----|
+| REST | `GET /api/v1/channels` |
+| Paged M3U | `GET /api/v1/channels.m3u` |
+| Full active playlist | `GET /api/v1/playlist.m3u` |
+| File-style JSON alias | `GET /streams.json` (same builder as REST) |
 
-## 🎯 Usage
+Useful query params: `page`, `limit`, `status` (default `online`), `server`, `group`, `q`, `sort` (`trending` \| `name` \| `server` \| `group`), `include=facets`.
 
-### Web Interface
-1. **Browse Channels**: View all available channels with status indicators
-2. **Search & Filter**: Find channels by name, country, or category
-3. **Live Preview**: Click any channel to preview in the built-in player
-4. **Copy Links**: Right-click to copy stream URLs for external players
-5. **Status Monitoring**: See real-time channel availability
+Docs: [/api](http://127.0.0.1:40006/api) · Playground: [/api/playground](http://127.0.0.1:40006/api/playground) · OpenAPI: [/openapi.yaml](http://127.0.0.1:40006/openapi.yaml) · Discovery: `/api/v1`
 
-### Channel Status
-- 🟢 **Online**: Stream is working and accessible
-- 🔴 **Offline**: Stream is down or unreachable
-- 🟡 **Unknown**: Status not yet determined
+Access is **public** (no API key). Catalog endpoints are lightly rate-limited; respect `wait_seconds` / HTTP 429.
 
-### Data Files
-- `jsons/IPTV_STREAMS_FILE.json` - Active working channels
-- `jsons/DEAD_STREAMS_FILE.json` - Offline/broken channels
-- `jsons/INVALID_LINKS_FILE.json` - Invalid or unreachable URLs
+## Web guide
 
-## ⚙️ Configuration
+- Desktop: left nav (Search, Home, Categories, Servers, My list, …)
+- Mobile/tablet: bottom tabs
+- Horizontal channel rails, custom player, prev/next, HTTP insecure warning
+- Client playback signals help promote/demote streams; viewer heartbeats via `/api/watching`
 
-### Default Settings
-- **Port**: 40006 (configurable in main.py)
-- **Update Interval**: Every 3 hours
-- **Timeout**: 30 seconds per channel
-- **Batch Size**: 10 channels processed simultaneously
+## Important environment variables
 
-### Customization
-Edit `main.py` to modify:
-- Source URLs and playlists
-- Update intervals
-- Port settings
-- Channel categories
-- Validation parameters
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `IPTV_DB_PATH` | `data/iptv.db` | SQLite path |
+| `IPTV_BIND_HOST` | `0.0.0.0` | Bind address |
+| `IPTV_PORT` | `40006` | HTTP port |
+| `IPTV_PUBLIC_BASE_URL` | _(empty)_ | Absolute URL base for API/M3U links |
+| `IPTV_PLAYLIST_SECRET` | _(empty)_ | Optional `?token=` for full playlist / backup |
+| `IPTV_ADMIN_PASSWORD` | _(falls back to playlist secret)_ | **Required** for HTTP catalog purge |
+| `IPTV_ADMIN_PURGE_BURST` | `3` | Purge attempt burst before rate limit |
+| `IPTV_ADMIN_PURGE_MIN_INTERVAL_SEC` | `60` | Seconds between purge attempt tokens |
+| `IPTV_ADMIN_PURGE_COOLDOWN_SEC` | `600` | Cooldown after a successful purge |
+| `IPTV_STARTUP_PURGE` | off | If set, purge catalog on startup (use with care) |
+| `IPTV_STARTUP_MENU_TIMEOUT_SEC` | `30` | TTY menu wait before auto **[1] Continue** (`0` = wait forever) |
+| `IPTV_TRUST_PROXY` | off | Trust `X-Forwarded-For` only when set |
+| `IPTV_PROXY_MAX_CONCURRENT` | `32` | Max concurrent `/proxy/stream` slots |
+| `IPTV_WAITRESS_THREADS` | _(config)_ | Waitress worker threads |
+| `IPTV_DB_DRIVER` | apsw→sqlite3 | Force `sqlite3` to skip APSW |
+| `IPTV_API_MIN_INTERVAL_SEC` | `2` | Public API rate interval |
+| `IPTV_API_BURST` | `3` | Public API burst |
+| `IPTV_VALIDATE_CONCURRENCY` | `12` | Parallel stream probes per health batch |
+| `IPTV_ACTIVE_HEALTH_BATCH` | `40` | Channels claimed per active-health pass |
+| `IPTV_PROBE_TOTAL_SEC` | `8` | Per-request timeout during validation |
 
-## 🔧 Troubleshooting
+## Tests
 
-### Common Issues
-1. **Port Already in Use**: Change port in main.py or kill conflicting processes
-2. **Missing Dependencies**: Run `pip install -r requirements.txt`
-3. **Connection Issues**: Check internet connection and firewall settings
-4. **Slow Loading**: Initial scan may take time to validate all channels
+```bash
+pip install pytest
+pytest -q
+```
 
-### Performance Tips
-- Use SSD storage for faster JSON file operations
-- Ensure stable internet connection for best results
-- Consider increasing timeout values for slow connections
+## Project layout
 
-## 🌟 Branches
-- **main**: Stable, production-ready version
-- **path-two**: Beta testing and experimental features
+- `main.py` — bootstrap (DB, task queue, Waitress)
+- `features/storage/` — SQLite store, host geo, normalize
+- `features/workers/` — health / ingest task queue
+- `features/public_api.py` — universal channels API
+- `templates/` — Jinja pages
+- `static/` — JS/CSS/icons/SW
 
-## ⚠️ Disclaimer
-
-> **Important**: Using IPTV services may be illegal in some countries. It is **your responsibility** to ensure compliance with local laws and regulations. Use this tool at your own risk. The developers are not liable for any misuse or legal consequences.
-
-The developers are not responsible for actions taken with this software, the purpose for which this software is used, what happens on your machine, modifications made to the software, or any consequences of usage. This tool is provided as-is without any warranties or guarantees. All streams are from publicly available sources.
-
-## 🤝 Contributing
-
-We welcome contributions! Feel free to:
-- Submit feature requests or bug reports via issues
-- Open pull requests for improvements or fixes
-- Add new verified sources and playlists
-- Improve documentation and examples
-- Give the project a ⭐ **star** on GitHub to show your support!
-
-**Note**: The main project owner is **[ZEROPOINTBRUH](https://github.com/ZEROPOINTBRUH)**.
-
-## 📄 License
-
-This project is open-source under the [MIT License](LICENSE).
-
-## 🙏 Credits
-
-- **Channel lists**: [iptv-org](https://github.com/iptv-org/iptv) and [Free-TV](https://github.com/Free-TV/IPTV)
-- **Stream validation**: Custom validation system with yt-dlp integration
-- **Web interface**: Modern Flask-based GUI with responsive design
-- **Community**: Built with ❤️ by the IPTV community
-
-## ☕ Support the Project
-
-Enjoying the IPTV Scanner? Consider supporting its development:
-
-**[☕ Buy me a coffee](https://ko-fi.com/zeropointbruh)**
-
-Your support helps maintain and improve the project:
-- 🔄 Keep sources updated and verified
-- 🚀 Add new features and improvements
-- 🌐 Support infrastructure and hosting
-- ⚡ Performance optimizations
-- 📱 Mobile app development (future)
-
-Every contribution, no matter how small, makes a difference! Thank you for your support! 🙏
-
-## 📞 Support
-
-For issues, feature requests, or questions:
-- Create an issue on this repository
-- Email: wegj1@hotmail.com
-- Check existing issues for solutions
-- Join discussions for community support
-
----
-
-**🎯 Enjoy your IPTV Scanner experience with verified, working channels from around the world!**
+Legacy JSON workers under `features/workers/workers.py` are **not** used by `main.py` (SQLite path only).

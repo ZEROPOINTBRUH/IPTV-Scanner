@@ -13,7 +13,7 @@ FILES = {
     "master": 'jsons/MASTER_CACHE_FILE.json',
 }
 
-DIRECTORIES = ['webroot', 'webroot/js']
+DIRECTORIES = ['templates', 'static', 'static/js', 'static/css', 'static/icons']
 
 WRITE_LOCK = threading.Lock()
 
@@ -26,6 +26,11 @@ IPTV_PUBLIC_BASE_URL = os.environ.get("IPTV_PUBLIC_BASE_URL", "").strip().rstrip
 IPTV_SITE_NAME = os.environ.get("IPTV_SITE_NAME", "IPTV Scanner").strip() or "IPTV Scanner"
 # Optional: require ?token=SECRET on /jellyfin/live.m3u and friends when set.
 IPTV_PLAYLIST_SECRET = os.environ.get("IPTV_PLAYLIST_SECRET", "").strip()
+# Password required for HTTP catalog purge (More → Purge). Falls back to
+# IPTV_PLAYLIST_SECRET when unset. If both are empty, /admin/purge is disabled.
+IPTV_ADMIN_PASSWORD = (
+    os.environ.get("IPTV_ADMIN_PASSWORD", "").strip() or IPTV_PLAYLIST_SECRET
+)
 # Fetch every playlist URL during M3U ingest to expand master manifests (very slow; default off).
 EXPAND_ON_INGEST = os.environ.get("IPTV_EXPAND_ON_INGEST", "0").strip().lower() in (
     "1", "true", "yes", "on",
@@ -51,6 +56,34 @@ try:
     )
 except (TypeError, ValueError):
     IPTV_DEAD_CHECK_INTERVAL_SEC = 6 * 60 * 60
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Stream proxy limits: cap simultaneous upstream pulls and bound connect time.
+IPTV_PROXY_MAX_CONCURRENT = max(1, _env_int("IPTV_PROXY_MAX_CONCURRENT", 32))
+IPTV_PROXY_CONNECT_TIMEOUT = max(0.5, _env_float("IPTV_PROXY_CONNECT_TIMEOUT", 8.0))
+# Honour X-Forwarded-For / X-Real-IP only when running behind a trusted reverse proxy.
+IPTV_TRUST_PROXY = os.environ.get("IPTV_TRUST_PROXY", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+# Seconds a claimed health-check row stays leased before another worker may take it.
+IPTV_CHECK_LEASE_SEC = max(1.0, _env_float("IPTV_CHECK_LEASE_SEC", 300.0))
+# Thread pool size when serving with Waitress (ignored by the Flask dev server).
+# Keep well above IPTV_PROXY_MAX_CONCURRENT so HLS + guide API don't starve.
+IPTV_WAITRESS_THREADS = max(1, _env_int("IPTV_WAITRESS_THREADS", 48))
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -78,6 +111,22 @@ try:
     API_PUBLIC_BURST = int(os.environ.get("IPTV_API_BURST", "3"))
 except (TypeError, ValueError):
     API_PUBLIC_BURST = 3
+# Hard cap for the ``limit`` query param on /api/v1/channels (default page stays 50).
+API_PUBLIC_MAX_LIMIT = max(API_PUBLIC_PAGE_SIZE, _env_int("IPTV_API_MAX_LIMIT", 200))
+# Looser buckets for the interactive guide (/channels) and the stream/image proxy.
+# Tokens refill one per interval, up to ``burst`` (per client IP, per scope).
+IPTV_CHANNELS_MIN_INTERVAL_SEC = max(0.01, _env_float("IPTV_CHANNELS_MIN_INTERVAL_SEC", 0.25))
+IPTV_CHANNELS_BURST = max(1, _env_int("IPTV_CHANNELS_BURST", 20))
+IPTV_PROXY_MIN_INTERVAL_SEC = max(0.01, _env_float("IPTV_PROXY_MIN_INTERVAL_SEC", 0.05))
+IPTV_PROXY_BURST = max(1, _env_int("IPTV_PROXY_BURST", 200))
+# Playback reports / viewer heartbeats (POST) per client IP.
+IPTV_REPORT_MIN_INTERVAL_SEC = max(0.01, _env_float("IPTV_REPORT_MIN_INTERVAL_SEC", 0.5))
+IPTV_REPORT_BURST = max(1, _env_int("IPTV_REPORT_BURST", 20))
+# Catalog purge attempts (wrong password + spam). Burst then slow refill.
+IPTV_ADMIN_PURGE_MIN_INTERVAL_SEC = max(1.0, _env_float("IPTV_ADMIN_PURGE_MIN_INTERVAL_SEC", 60.0))
+IPTV_ADMIN_PURGE_BURST = max(1, _env_int("IPTV_ADMIN_PURGE_BURST", 3))
+# Cooldown after a successful purge (seconds) per client IP.
+IPTV_ADMIN_PURGE_COOLDOWN_SEC = max(30, _env_int("IPTV_ADMIN_PURGE_COOLDOWN_SEC", 600))
 
 # Kind support reminder (shown in public JSON + /api docs). Optional override via env.
 SUPPORT_MESSAGE = (

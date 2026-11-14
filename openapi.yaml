@@ -1,0 +1,372 @@
+openapi: 3.0.3
+info:
+  title: IPTV Scanner Public API
+  version: "1"
+  description: |
+    Universal, key-less channel catalog for browsers, VR worlds, game engines,
+    IPTV apps and scripts. One endpoint (`/api/v1/channels`) with filters and
+    paging; the older `/streams*.json|.m3u`, `/unchecked/*` and `/api/v1/streams`
+    URLs are deprecated thin aliases of it.
+
+    Be kind: fetch at most one page per `wait_seconds`, cache locally, and honour
+    `Retry-After` on HTTP 429. Please consider supporting the project (see the
+    `support` block on `/api/v1`).
+  license:
+    name: See repository
+servers:
+  - url: /
+    description: This server (set IPTV_PUBLIC_BASE_URL for absolute links)
+tags:
+  - name: channels
+  - name: reports
+paths:
+  /api/v1:
+    get:
+      summary: Discovery index
+      operationId: getIndex
+      responses:
+        "200":
+          description: Endpoint list, query reference, support links.
+          content:
+            application/json:
+              schema:
+                type: object
+  /api/v1/channels:
+    get:
+      tags: [channels]
+      summary: List channels (paged JSON)
+      operationId: listChannels
+      parameters:
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/status"
+        - $ref: "#/components/parameters/server"
+        - $ref: "#/components/parameters/group"
+        - $ref: "#/components/parameters/q"
+        - $ref: "#/components/parameters/media_type"
+        - $ref: "#/components/parameters/sort"
+        - $ref: "#/components/parameters/sort_dir"
+        - $ref: "#/components/parameters/include"
+      responses:
+        "200":
+          description: One page of channels. `next_url` keeps every active filter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChannelsPage"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /api/v1/channels.m3u:
+    get:
+      tags: [channels]
+      summary: List channels (paged M3U)
+      description: Same query parameters and paging as the JSON endpoint. Next page is advertised via `Link rel="next"` and `#IPTV-SCANNER-NEXT`.
+      operationId: listChannelsM3u
+      parameters:
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/status"
+        - $ref: "#/components/parameters/server"
+        - $ref: "#/components/parameters/group"
+        - $ref: "#/components/parameters/q"
+        - $ref: "#/components/parameters/media_type"
+        - $ref: "#/components/parameters/sort"
+        - $ref: "#/components/parameters/sort_dir"
+      responses:
+        "200":
+          description: M3U playlist page.
+          content:
+            application/vnd.apple.mpegurl:
+              schema:
+                type: string
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /api/v1/playlist.m3u:
+    get:
+      tags: [channels]
+      summary: Full online lineup as one M3U (Jellyfin / Plex / Emby / VLC)
+      operationId: getPlaylist
+      parameters:
+        - $ref: "#/components/parameters/server"
+        - $ref: "#/components/parameters/group"
+        - $ref: "#/components/parameters/media_type"
+        - name: proxy
+          in: query
+          description: "`1` routes every URL through this server's `/proxy/stream`."
+          schema:
+            type: boolean
+            default: false
+        - name: token
+          in: query
+          description: Required only when the server sets IPTV_PLAYLIST_SECRET.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: M3U playlist (cached ~60 s).
+          content:
+            application/vnd.apple.mpegurl:
+              schema:
+                type: string
+        "403":
+          description: Missing or wrong token.
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /api/v1/report-playback:
+    post:
+      tags: [reports]
+      summary: Report a playback problem
+      description: |
+        `no_playback` queues a priority health check and verify task (the channel
+        is only marked offline if that verification fails). `slow_load` gives a
+        mild priority bump.
+      operationId: reportPlayback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, event]
+              properties:
+                url:
+                  type: string
+                  description: Channel stream `url` exactly as listed.
+                event:
+                  type: string
+                  enum: [no_playback, slow_load]
+                load_ms:
+                  type: integer
+                  minimum: 0
+                  description: Optional time-to-first-frame in milliseconds.
+      responses:
+        "200":
+          description: Report accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  event: {type: string}
+                  status: {type: string}
+                  priority_check_queued: {type: boolean}
+                  verify:
+                    type: string
+                    nullable: true
+                    description: queue | thread | deduped
+                  revision: {type: integer}
+        "400":
+          description: Missing url or invalid event.
+        "404":
+          description: Unknown channel.
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /api/report-alive:
+    post:
+      tags: [reports]
+      summary: Report that a stream played successfully
+      description: Promotes the channel to online immediately and queues a priority verify.
+      operationId: reportAlive
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: {type: string}
+      responses:
+        "200":
+          description: Channel promoted and verify queued.
+        "404":
+          description: Unknown channel.
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /api/v1/watching:
+    post:
+      tags: [reports]
+      summary: Viewer heartbeat ("watching now")
+      description: Send every ~15-30 s while a channel is playing. A viewer counts for 45 s after the last beat.
+      operationId: watching
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: {type: string}
+                session_id:
+                  type: string
+                  description: Stable per-viewer id (max 128 chars). Optional; derived from IP + User-Agent when omitted.
+      responses:
+        "200":
+          description: Current viewers for the channel.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  url: {type: string}
+                  session_id: {type: string}
+                  viewers: {type: integer}
+        "404":
+          description: Unknown channel.
+        "429":
+          $ref: "#/components/responses/RateLimited"
+components:
+  parameters:
+    page:
+      name: page
+      in: query
+      schema: {type: integer, minimum: 1, default: 1}
+    limit:
+      name: limit
+      in: query
+      description: Rows per page (capped by the server; default 50, max 200).
+      schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+    status:
+      name: status
+      in: query
+      description: >
+        `online` (default), `unchecked` (pending + unknown), `dead` (offline + error),
+        `all`, or one individual status.
+      schema:
+        type: string
+        enum: [online, unchecked, dead, all, pending, unknown, offline, error]
+        default: online
+    server:
+      name: server
+      in: query
+      description: Country code or name of where the stream is hosted. Alias `country`.
+      schema: {type: string}
+    group:
+      name: group
+      in: query
+      description: Exact category name.
+      schema: {type: string}
+    q:
+      name: q
+      in: query
+      description: Text search over name, group, country and URL.
+      schema: {type: string}
+    media_type:
+      name: media_type
+      in: query
+      schema:
+        type: string
+        enum: [live, vod, unknown, all]
+        default: live
+    sort:
+      name: sort
+      in: query
+      schema:
+        type: string
+        enum: [trending, name, server, group, last_checked_at, scanned]
+        default: trending
+    sort_dir:
+      name: sort_dir
+      in: query
+      description: Defaults to `desc` for `trending`, `asc` otherwise.
+      schema:
+        type: string
+        enum: [asc, desc]
+    include:
+      name: include
+      in: query
+      description: Comma list. `facets` adds `facets.countries[]` and `facets.groups[]`.
+      schema:
+        type: string
+        example: facets
+  responses:
+    RateLimited:
+      description: Too many requests; wait `Retry-After` seconds.
+      headers:
+        Retry-After:
+          schema: {type: integer}
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              ok: {type: boolean}
+              error: {type: string, example: rate_limited}
+              retry_after: {type: integer}
+  schemas:
+    Channel:
+      type: object
+      properties:
+        name: {type: string}
+        url: {type: string, description: Origin stream URL.}
+        logo: {type: string}
+        group: {type: string}
+        server:
+          type: string
+          description: Country of the stream host (mirrors `country`).
+        country: {type: string}
+        status:
+          type: string
+          enum: [online, pending, unknown, offline, error]
+        media_type:
+          type: string
+          enum: [live, vod, unknown]
+        proxy_url:
+          type: string
+          description: Same stream through this server's `/proxy/stream` (CORS-friendly, HTTPS-safe).
+        viewers:
+          type: integer
+          description: Viewers watching right now.
+    ChannelsPage:
+      type: object
+      required: [ok, api, revision, page, per_page, total, total_pages, has_more, next_url, prev_url, wait_seconds, channels]
+      properties:
+        ok: {type: boolean}
+        api: {type: string, example: iptv-scanner-public/v1}
+        revision:
+          type: integer
+          description: Changes whenever the catalog changes; cache until it does.
+        page: {type: integer}
+        per_page: {type: integer}
+        total: {type: integer}
+        total_pages: {type: integer}
+        has_more: {type: boolean}
+        next_url:
+          type: string
+          nullable: true
+          description: Absolute URL of the next page with all filters preserved; null on the last page.
+        prev_url:
+          type: string
+          nullable: true
+        wait_seconds:
+          type: integer
+          description: Minimum polite delay between page requests.
+        channels:
+          type: array
+          items:
+            $ref: "#/components/schemas/Channel"
+        facets:
+          type: object
+          description: Present only with `include=facets`.
+          properties:
+            countries:
+              type: array
+              items:
+                type: object
+                properties:
+                  code: {type: string}
+                  name: {type: string}
+                  count: {type: integer}
+            groups:
+              type: array
+              items:
+                type: object
+                properties:
+                  name: {type: string}
+                  count: {type: integer}
+        warning:
+          type: string
+          description: Present when `status` is not `online` (streams may not load).

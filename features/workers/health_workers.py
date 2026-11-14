@@ -70,14 +70,22 @@ log = logging.getLogger("health_workers")
 # Tunables (env-first so operators can override without editing config.py)
 # ---------------------------------------------------------------------------
 
-ACTIVE_HEALTH_INTERVAL_SEC = int(os.environ.get("IPTV_ACTIVE_HEALTH_INTERVAL_SEC", "180"))
-DEAD_REVIVAL_INTERVAL_SEC = int(os.environ.get("IPTV_DEAD_REVIVAL_INTERVAL_SEC", "600"))
+# Cadences: health runs again soon after each batch finishes (schedule_repeat
+# sleeps *after* completion). Keep this short so ~12k pending rows drain.
+ACTIVE_HEALTH_INTERVAL_SEC = int(os.environ.get("IPTV_ACTIVE_HEALTH_INTERVAL_SEC", "20"))
+DEAD_REVIVAL_INTERVAL_SEC = int(os.environ.get("IPTV_DEAD_REVIVAL_INTERVAL_SEC", "120"))
 INGEST_INTERVAL_SEC = int(os.environ.get("IPTV_INGEST_INTERVAL_SEC", str(45 * 60)))
-ICON_PREFETCH_INTERVAL_SEC = int(os.environ.get("IPTV_ICON_PREFETCH_INTERVAL_SEC", "60"))
+ICON_PREFETCH_INTERVAL_SEC = int(os.environ.get("IPTV_ICON_PREFETCH_INTERVAL_SEC", "90"))
 EPG_REFRESH_INTERVAL_SEC = int(os.environ.get("IPTV_EPG_REFRESH_INTERVAL_SEC", str(6 * 60 * 60)))
 
-ACTIVE_HEALTH_BATCH_SIZE = int(os.environ.get("IPTV_ACTIVE_HEALTH_BATCH", str(BATCH_SIZE * 2)))
+GEO_BACKFILL_INTERVAL_SEC = int(os.environ.get("IPTV_GEO_BACKFILL_INTERVAL_SEC", "180"))
+GEO_BACKFILL_BATCH_SIZE = int(os.environ.get("IPTV_GEO_BACKFILL_BATCH", "40"))
+
+ACTIVE_HEALTH_BATCH_SIZE = int(os.environ.get("IPTV_ACTIVE_HEALTH_BATCH", "40"))
 DEAD_REVIVAL_BATCH_SIZE = int(os.environ.get("IPTV_DEAD_REVIVAL_BATCH", str(BATCH_SIZE)))
+# Parallel stream probes per batch. Higher = faster drain; still capped so
+# Waitress / DNS are not starved.
+VALIDATE_CONCURRENCY = max(1, int(os.environ.get("IPTV_VALIDATE_CONCURRENCY", "12")))
 ICON_PREFETCH_BATCH_SIZE = int(os.environ.get("IPTV_ICON_PREFETCH_BATCH", "10"))
 
 
@@ -86,7 +94,13 @@ ICON_PREFETCH_BATCH_SIZE = int(os.environ.get("IPTV_ICON_PREFETCH_BATCH", "10"))
 # ---------------------------------------------------------------------------
 
 def _new_session() -> aiohttp.ClientSession:
-    connector = aiohttp.TCPConnector(ssl=False, limit=100, limit_per_host=20)
+    connector = aiohttp.TCPConnector(
+        ssl=False,
+        limit=max(64, VALIDATE_CONCURRENCY * 4),
+        limit_per_host=8,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
     return aiohttp.ClientSession(connector=connector)
 
 
@@ -156,16 +170,39 @@ def _short(text: object, width: int = 32) -> str:
     return s if len(s) <= width else s[: width - 1] + "…"
 
 
+# Hard ceiling per channel so one hung CDN cannot pin a concurrency slot.
+_VALIDATE_CHANNEL_BUDGET_SEC = float(os.environ.get("IPTV_VALIDATE_CHANNEL_BUDGET_SEC", "18"))
+
+
 async def _validate_batch(
     channels: list[dict],
 ) -> list[tuple[dict, bool, Optional[str]]]:
-    """Validate ``channels`` concurrently; returns ``(channel, ok, reason)``."""
+    """Validate ``channels`` with bounded concurrency; returns ``(channel, ok, reason)``."""
     if not channels:
         return []
+    sem = asyncio.Semaphore(VALIDATE_CONCURRENCY)
     results: list[tuple[dict, bool, Optional[str]]] = []
+
     async with _new_session() as session:
-        coros = [validate_channel(session, dict(ch)) for ch in channels]
-        raw = await asyncio.gather(*coros, return_exceptions=True)
+
+        async def _one(ch: dict):
+            async with sem:
+                try:
+                    return await asyncio.wait_for(
+                        validate_channel(session, dict(ch)),
+                        timeout=_VALIDATE_CHANNEL_BUDGET_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    channel = dict(ch)
+                    channel["status"] = "offline"
+                    channel["playing_now"] = "Stream error: validation timeout"
+                    return channel, False
+
+        raw = await asyncio.gather(
+            *[_one(ch) for ch in channels],
+            return_exceptions=True,
+        )
+
     for orig, item in zip(channels, raw):
         if isinstance(item, Exception):
             channel = dict(orig)
@@ -263,9 +300,10 @@ async def run_active_health_batch(
 
     started = time.perf_counter()
     results = await _validate_batch(batch)
-    store.update_channel_results(_results_to_dicts(results))
+    payload = _results_to_dicts(results)
+    await asyncio.to_thread(store.update_channel_results, payload)
     try:
-        store.decay_trend_scores()
+        await asyncio.to_thread(store.decay_trend_scores)
     except Exception:  # noqa: BLE001
         log.debug("active-health: trend decay skipped", exc_info=True)
     summary = _summarize_results(results)
@@ -300,6 +338,29 @@ async def run_active_health_batch(
         elapsed_sec=summary["elapsed_sec"],
     )
     return summary
+
+
+async def run_verify_channel(
+    url: str,
+    store: Optional[ChannelStore] = None,
+    *,
+    reason: str = "",
+) -> dict:
+    """Re-validate one channel right now (client reports: alive / no_playback / slow_load).
+
+    Unlike a batch run this does not claim a lease; it simply validates the row
+    and writes the result back. A failed check demotes the channel the same way
+    a health batch would (``fail_delta`` +1, status offline/error).
+    """
+    store = store or get_default_store()
+    channel = store.get_channel(url)
+    if not channel:
+        return {"verified": False, "reason": "unknown channel"}
+    results = await _validate_batch([channel])
+    await asyncio.to_thread(store.update_channel_results, _results_to_dicts(results))
+    _ch, ok, fail = results[0]
+    log.debug("verify %s (%s): %s", url, reason or "-", "online" if ok else fail)
+    return {"verified": True, "online": bool(ok), "fail_reason": fail, "trigger": reason}
 
 
 async def active_health_loop(
@@ -346,7 +407,7 @@ async def run_dead_revival_batch(
     for ch, ok, _reason in results:
         if ok:
             ch["status"] = "online"
-    store.update_channel_results(_results_to_dicts(results))
+    await asyncio.to_thread(store.update_channel_results, _results_to_dicts(results))
     summary = _summarize_results(results)
     summary["claimed"] = len(batch)
     summary["elapsed_sec"] = round(time.perf_counter() - started, 2)
@@ -400,32 +461,52 @@ async def dead_revival_loop(
 # Ingest — full scrape merged via upsert_from_ingest
 # ---------------------------------------------------------------------------
 
+_INGEST_LOCK = asyncio.Lock()
+
+
 async def run_ingest_sources(store: Optional[ChannelStore] = None) -> dict:
     """Full source scrape, upserted into the store without wiping.
 
     Delegates to :func:`ingest.check_all_global_sources` (blocking, so we
     hop to a worker thread) and then merges the result via
     :meth:`ChannelStore.upsert_from_ingest`.
-    """
-    store = store or get_default_store()
-    started = time.perf_counter()
-    channels = await asyncio.to_thread(check_all_global_sources)
-    summary = store.upsert_from_ingest(channels)
-    summary["scraped"] = len(channels)
-    summary["elapsed_sec"] = round(time.perf_counter() - started, 2)
 
-    task_queue.log_worker_batch(
-        "ingest-sources",
-        [
-            f"scraped   {summary['scraped']} channels",
-            f"new       {summary['new']}",
-            f"updated   {summary['updated']}",
-            f"skipped   {summary['skipped']}",
-            f"elapsed   {summary['elapsed_sec']}s",
-        ],
-        limit=5,
-    )
-    return summary
+    Concurrent callers share one lock so a second kick (``/scan``, stacked
+    cadence, etc.) cannot double-scrape and freeze SQLite.
+    """
+    if _INGEST_LOCK.locked():
+        log.info("ingest_sources: already running; skipping overlapping kick")
+        return {
+            "new": 0,
+            "updated": 0,
+            "skipped": 0,
+            "scraped": 0,
+            "elapsed_sec": 0,
+            "skipped_busy": True,
+        }
+
+    async with _INGEST_LOCK:
+        store = store or get_default_store()
+        started = time.perf_counter()
+        channels = await asyncio.to_thread(check_all_global_sources)
+        # Upsert off the event loop — a full catalog write must not freeze
+        # schedule_repeat / health while SQLite commits chunk by chunk.
+        summary = await asyncio.to_thread(store.upsert_from_ingest, channels)
+        summary["scraped"] = len(channels)
+        summary["elapsed_sec"] = round(time.perf_counter() - started, 2)
+
+        task_queue.log_worker_batch(
+            "ingest-sources",
+            [
+                f"[scraped] {summary['scraped']} channels",
+                f"[new] {summary['new']}",
+                f"[updated] {summary['updated']}",
+                f"[skipped] {summary['skipped']}",
+                f"[elapsed] {summary['elapsed_sec']}s",
+            ],
+            limit=5,
+        )
+        return summary
 
 
 async def ingest_sources_loop(
@@ -460,33 +541,21 @@ def _fetch_text(url: str, timeout: int = 20) -> Optional[str]:
 
 
 def _parse_m3u_channels(content: str, source_url: str) -> list[dict]:
-    channels: list[dict] = []
-    current: dict = {}
-    for raw in content.splitlines():
-        line = raw.strip()
-        if line.startswith("#EXTINF:"):
-            parts = line.split(",")
-            if len(parts) > 1:
-                current["name"] = parts[-1].strip()
-            for attr in parts[0].split():
-                if attr.startswith("tvg-name="):
-                    current["name"] = attr.split("=", 1)[1].strip('"')
-                elif attr.startswith("tvg-logo="):
-                    current["tvg_logo"] = attr.split("=", 1)[1].strip('"')
-                elif attr.startswith("tvg-id="):
-                    current["tvg_id"] = attr.split("=", 1)[1].strip('"')
-                elif attr.startswith("group-title="):
-                    current["group_title"] = attr.split("=", 1)[1].strip('"')
-        elif line.startswith("http") and current:
-            current["url"] = line
-            current["playing_now"] = "Not available"
-            current["status"] = "unknown"
-            current["country"] = infer_country(current, source_url)
-            current["audio_language"] = (
-                infer_language_code(source_url) or infer_language_code(line)
-            )
-            channels.append(current)
-            current = {}
+    """Parse Extended-M3U with quoted attrs + relative URLs (shared parser)."""
+    from features.ingest.m3u_parse import parse_m3u_channels
+
+    channels = []
+    for entry in parse_m3u_channels(content, source_url):
+        ch = dict(entry)
+        ch.setdefault("playing_now", "Not available")
+        ch.setdefault("status", "unknown")
+        ch["country"] = infer_country(ch, source_url, live=True)
+        ch["audio_language"] = (
+            ch.get("audio_language")
+            or infer_language_code(source_url)
+            or infer_language_code(ch.get("url") or "")
+        )
+        channels.append(ch)
     return channels
 
 
@@ -526,7 +595,7 @@ def _expand_discovered(seed_url: str) -> list[dict]:
                     continue
                 variant.setdefault("status", "unknown")
                 variant.setdefault("playing_now", "Not available")
-                variant.setdefault("country", infer_country(variant, url))
+                variant.setdefault("country", infer_country(variant, url, live=True))
                 seen_urls.add(v_url)
                 discovered.append(variant)
             continue
@@ -675,6 +744,49 @@ async def icon_prefetch_loop(
 
 
 # ---------------------------------------------------------------------------
+# Server geo backfill — host-based country for channels still GLOBAL
+# ---------------------------------------------------------------------------
+
+async def run_geo_backfill_batch(
+    store: Optional[ChannelStore] = None,
+    *,
+    limit: Optional[int] = None,
+) -> dict:
+    """Geolocate stream hosts for up to ``limit`` GLOBAL/blank-country channels.
+
+    The store call blocks on DNS and the rate-limited geo API, so it runs in a
+    worker thread.
+    """
+    store = store or get_default_store()
+    limit = limit or GEO_BACKFILL_BATCH_SIZE
+    started = time.perf_counter()
+    updated = await asyncio.to_thread(store.backfill_server_countries, limit)
+    elapsed = round(time.perf_counter() - started, 2)
+    if updated:
+        task_queue.log_worker_batch(
+            "geo-backfill",
+            [f"updated   {updated} channel countries", f"elapsed   {elapsed}s"],
+            limit=2,
+        )
+    return {"updated": updated, "elapsed_sec": elapsed}
+
+
+async def geo_backfill_loop(
+    interval_sec: Optional[float] = None,
+    store: Optional[ChannelStore] = None,
+) -> None:
+    interval = float(interval_sec if interval_sec is not None else GEO_BACKFILL_INTERVAL_SEC)
+    while True:
+        try:
+            await run_geo_backfill_batch(store)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("geo_backfill_loop: batch failed")
+        await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
 # EPG refresh (stub — placeholder for future work)
 # ---------------------------------------------------------------------------
 
@@ -765,6 +877,9 @@ __all__ = [
     "INGEST_INTERVAL_SEC",
     "ICON_PREFETCH_INTERVAL_SEC",
     "EPG_REFRESH_INTERVAL_SEC",
+    "GEO_BACKFILL_INTERVAL_SEC",
+    "run_geo_backfill_batch",
+    "geo_backfill_loop",
     "classify_fail_reason",
     "run_active_health_batch",
     "active_health_loop",

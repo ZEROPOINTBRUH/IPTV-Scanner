@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#050812">
+    <title>API Playground — {{ site_name }}</title>
+    <meta name="description" content="Build and run live {{ site_name }} API queries — tap categories, get results.">
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Lexend:wght@600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/api_playground.css') }}?v=2">
+</head>
+<body class="pg-body">
+    <div class="pg-shell">
+        <nav class="pg-nav">
+            <a href="/">&larr; Live TV Guide</a>
+            <div class="pg-nav-links">
+                <a href="/api/">API docs</a>
+                <a href="/openapi.yaml">OpenAPI</a>
+            </div>
+        </nav>
+
+        <header class="pg-hero">
+            <div class="pg-kicker">{{ site_name }}</div>
+            <div class="pg-hero-row">
+                <div>
+                    <h1>API Playground</h1>
+                    <p>Tap categories and servers, then Run. Multi-select is OR — pick as many as you want.</p>
+                </div>
+                <label class="pg-mode-toggle" title="Show page, limit, manual fields, and more">
+                    <input id="apiExpert" type="checkbox">
+                    <span>Expert mode</span>
+                </label>
+            </div>
+        </header>
+
+        <div
+            id="playground"
+            class="pg-layout"
+            data-page-size="{{ page_size }}"
+            data-wait="{{ wait_seconds }}"
+            data-base="{{ base_url or '' }}"
+        >
+            <section class="pg-panel" aria-label="Query builder">
+                <div class="pg-panel-head">
+                    <h2>Build query</h2>
+                    <span id="apiModeBadge" class="pg-meta">Easy</span>
+                </div>
+                <div class="pg-panel-body">
+                    <div class="pg-section">
+                        <div class="pg-label">Quick starts</div>
+                        <div id="apiPresets" class="pg-chips"></div>
+                    </div>
+
+                    <div class="pg-section">
+                        <div class="pg-label">Result type</div>
+                        <div id="apiFormat" class="pg-chips" role="group" aria-label="Response format"></div>
+                    </div>
+
+                    <div class="pg-section">
+                        <div class="pg-label-row">
+                            <div class="pg-label pg-label-inline">Categories <span class="pg-hint">tap one or more</span></div>
+                            <button type="button" id="apiClearGroups" class="pg-text-btn">Clear</button>
+                        </div>
+                        <input id="apiGroupFilter" class="pg-filter" type="search" placeholder="Filter category list…" autocomplete="off">
+                        <div id="apiFacetGroupChips" class="pg-chips pg-facet-scroll pg-facet-tall">
+                            <span class="pg-loading">Loading categories…</span>
+                        </div>
+                        <div id="apiSelectedGroups" class="pg-selected" aria-live="polite"></div>
+                    </div>
+
+                    <div class="pg-section">
+                        <div class="pg-label-row">
+                            <div class="pg-label pg-label-inline">Servers <span class="pg-hint">tap one or more</span></div>
+                            <button type="button" id="apiClearServers" class="pg-text-btn">Clear</button>
+                        </div>
+                        <input id="apiServerFilter" class="pg-filter" type="search" placeholder="Filter servers…" autocomplete="off">
+                        <div id="apiFacetServerChips" class="pg-chips pg-facet-scroll">
+                            <span class="pg-loading">Loading servers…</span>
+                        </div>
+                        <div id="apiSelectedServers" class="pg-selected" aria-live="polite"></div>
+                    </div>
+
+                    <div class="pg-section">
+                        <div class="pg-label">Status</div>
+                        <div id="apiStatus" class="pg-chips"></div>
+                    </div>
+
+                    <div class="pg-section">
+                        <div class="pg-label">Sort</div>
+                        <div id="apiSort" class="pg-chips"></div>
+                    </div>
+
+                    <div class="pg-section">
+                        <label class="pg-label" for="apiQ">Search name <span class="pg-hint">optional</span></label>
+                        <input id="apiQ" type="search" placeholder="CNN, BBC…" autocomplete="off">
+                    </div>
+
+                    <div id="apiExpertPanel" class="pg-expert hidden">
+                        <div class="pg-expert-title">Expert options</div>
+
+                        <div class="pg-section pg-grid pg-grid-2">
+                            <div class="pg-field">
+                                <label class="pg-label" for="apiGroup">group (manual)</label>
+                                <input id="apiGroup" type="text" placeholder="News,Sports" autocomplete="off">
+                            </div>
+                            <div class="pg-field">
+                                <label class="pg-label" for="apiServer">server (manual)</label>
+                                <input id="apiServer" type="text" placeholder="US,GB" autocomplete="off">
+                            </div>
+                            <div class="pg-field">
+                                <label class="pg-label" for="apiPage">Page</label>
+                                <input id="apiPage" type="number" min="1" value="1">
+                            </div>
+                            <div class="pg-field">
+                                <label class="pg-label" for="apiLimit">Limit</label>
+                                <input id="apiLimit" type="number" min="1" max="200" value="{{ page_size }}">
+                            </div>
+                        </div>
+
+                        <div class="pg-section pg-grid pg-grid-2">
+                            <div>
+                                <div class="pg-label">Direction</div>
+                                <div id="apiSortDir" class="pg-chips"></div>
+                            </div>
+                            <div>
+                                <div class="pg-label">Media type</div>
+                                <div id="apiMedia" class="pg-chips"></div>
+                            </div>
+                        </div>
+
+                        <div class="pg-section pg-toggles">
+                            <label>
+                                <input id="apiFacets" type="checkbox">
+                                Include facets in response
+                            </label>
+                            <label id="apiProxyWrap" class="hidden">
+                                <input id="apiProxy" type="checkbox">
+                                Proxy streams
+                            </label>
+                            <button type="button" id="apiLoadFacets" class="chip">Refresh category list</button>
+                        </div>
+                    </div>
+
+                    <div class="pg-section">
+                        <div class="pg-label">Request URL</div>
+                        <div class="pg-url-bar">
+                            <code id="apiUrl" class="pg-url mono"></code>
+                            <div class="pg-actions">
+                                <button type="button" id="apiCopy" class="pg-btn">Copy</button>
+                                <button type="button" id="apiOpen" class="pg-btn">Open</button>
+                                <button type="button" id="apiRun" class="pg-btn pg-btn-primary">Run</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="pg-panel pg-response" aria-label="Live response">
+                <div class="pg-panel-head">
+                    <h2>Response</h2>
+                    <div class="pg-tabs" role="tablist">
+                        <button type="button" id="apiViewCards" class="pg-tab is-on" role="tab">Cards</button>
+                        <button type="button" id="apiViewRaw" class="pg-tab" role="tab">Raw</button>
+                    </div>
+                </div>
+                <div class="pg-panel-body">
+                    <div id="apiMeta" class="pg-meta" style="margin-bottom:0.75rem">Loading catalog choices…</div>
+                    <div id="apiPreview" class="pg-preview" aria-live="polite"></div>
+                    <pre id="apiOut" class="pg-out mono is-hidden">// Response JSON or M3U appears here</pre>
+                </div>
+            </section>
+        </div>
+
+        <p class="pg-foot">
+            Docs &amp; curl examples: <a href="/api/">API page</a>.
+            Rate limits still apply (~{{ burst }} burst, then about every {{ wait_seconds }}s).
+        </p>
+    </div>
+
+    <datalist id="apiGroupList"></datalist>
+    <datalist id="apiServerList"></datalist>
+    <script src="{{ url_for('static', filename='js/api_playground.js') }}?v=2"></script>
+</body>
+</html>

@@ -17,6 +17,7 @@ from config import (
     MAX_VARIANTS_PER_CHANNEL,
     SCRAPE_VARIANT_MODE,
 )
+from .m3u_parse import looks_like_hls_url, parse_m3u_channels
 from .sources import (
     ALL_DIRECT_SOURCES,
     EXCEPTION_CHANNELS,
@@ -26,56 +27,15 @@ from .sources import (
 
 
 def check_channels(m3u_url):
-    """Parse M3U playlist and return channel list with redirect detection and quality optimization."""
+    """Parse M3U playlist and return channel list (quoted attrs + relative URLs)."""
     try:
         response = requests.get(m3u_url, timeout=30, headers=HEADERS)
-        if response.status_code == 200:
-            content = response.text
-            channels = []
-            current_channel = {}
-
-            for line in content.split('\n'):
-                line = line.strip()
-                if line.startswith('#EXTINF:'):
-                    # Parse channel info
-                    parts = line.split(',')
-                    # The channel name is the last part after the comma
-                    if len(parts) > 1:
-                        current_channel['name'] = parts[-1].strip()
-
-                    # Parse attributes from the first part
-                    attr_part = parts[0]
-                    for attr in attr_part.split():
-                        if attr.startswith('tvg-name='):
-                            current_channel['name'] = attr.split('=')[1].strip('"')
-                        elif attr.startswith('tvg-logo='):
-                            current_channel['tvg_logo'] = attr.split('=')[1].strip('"')
-                        elif attr.startswith('tvg-id='):
-                            current_channel['tvg_id'] = attr.split('=')[1].strip('"')
-                        elif attr.startswith('group-title='):
-                            current_channel['group_title'] = attr.split('=')[1].strip('"')
-                        elif attr.startswith('channel-id='):
-                            current_channel['tvg_id'] = attr.split('=')[1].strip('"')
-
-                elif line.startswith('http') and current_channel:
-                    original_url = line.strip()
-
-                    # Temporarily disable redirect processing to get channels loading
-                    processed_url = original_url  # process_stream_url(original_url)
-
-                    current_channel['url'] = processed_url
-                    current_channel['playing_now'] = 'Not available'
-                    current_channel['status'] = 'unknown'
-                    channels.append(current_channel.copy())
-                    current_channel = {}
-
-            # Add exception channels
-            channels.extend(EXCEPTION_CHANNELS)
-
-            return channels
-        else:
+        if response.status_code != 200:
             logging.debug("Failed to fetch M3U playlist")
             return []
+        channels = parse_m3u_channels(response.text, m3u_url)
+        channels.extend(EXCEPTION_CHANNELS)
+        return channels
     except Exception as e:
         logging.debug("Error parsing M3U playlist: %s", e)
         return []
@@ -102,20 +62,66 @@ def guess_image_ext(content_type, source_url):
     return '.png'
 
 
+# Shared listing art when a channel has no specific logo (never stored per-channel).
+GENERIC_ICON_URL = '/static/channel-generic.svg'
+
+
 def find_local_icon_url(safe_name):
     """Return URL path for an already-cached icon, or None."""
     for ext in ('.png', '.webp', '.jpg', '.jpeg', '.gif'):
-        rel = f'webroot/icons/{safe_name}{ext}'
+        rel = f'static/icons/{safe_name}{ext}'
         if os.path.exists(rel):
             return f'/icons/{safe_name}{ext}'
     return None
 
 
-def infer_country(channel, source_url=None):
-    """Infer country code from channel metadata or source URL."""
-    from features.storage.geo import resolve_country_code
+def resolve_channel_icon_urls(channel):
+    """Return ``(icon_url, generic_icon_url)`` for listing.
 
-    return resolve_country_code(channel or {}, source_url) or "GLOBAL"
+    * ``icon_url`` — channel-specific art (local cache, stored icon, or playlist
+      ``tvg_logo``). Empty string when none.
+    * ``generic_icon_url`` — always the shared site placeholder so every row
+      can be listed with at least one image link.
+    """
+    channel = channel or {}
+    name = channel.get('name') or ''
+    local = find_local_icon_url(channel_icon_safe_name(name))
+    specific = (
+        local
+        or (channel.get('icon_url') or '').strip()
+        or (channel.get('tvg_logo') or '').strip()
+    )
+    if specific == GENERIC_ICON_URL or specific.endswith('/channel-generic.svg'):
+        specific = ''
+    return specific, GENERIC_ICON_URL
+
+
+def infer_country(channel, source_url=None, live=False):
+    """Infer country code, preferring where the stream host is located.
+
+    The stream URL's host is geolocated first (cached lookups always; DNS + geo
+    API only when ``live=True``, and never blocking on the API rate limit).
+    Falls back to channel metadata / source URL, then ``"GLOBAL"``.
+    """
+    from features.storage.geo import (
+        is_placeholder_country,
+        resolve_country_code,
+        resolve_server_country_from_url,
+    )
+
+    channel = channel or {}
+    stream_url = channel.get("url") if isinstance(channel, dict) else None
+    if stream_url:
+        try:
+            host_code = resolve_server_country_from_url(
+                stream_url, block=False, allow_network=bool(live)
+            )
+        except Exception:
+            host_code = None
+        if host_code and not is_placeholder_country(host_code):
+            return host_code
+
+    return resolve_country_code(channel, source_url) or "GLOBAL"
 
 
 def infer_language_code(url):
@@ -320,8 +326,8 @@ def expand_master_manifest(channel, content, base_url):
     return variants
 
 
-def maybe_expand_channel(channel, depth=0):
-    """Expand channel recursively for nested manifests and variant streams."""
+def maybe_expand_channel(channel, depth=0, *, expand_variants=True):
+    """Expand channel recursively for nested channel lists, masters, and variants."""
     if depth >= MAX_EXPANSION_DEPTH:
         return [channel]
 
@@ -329,8 +335,11 @@ def maybe_expand_channel(channel, depth=0):
     if not url:
         return [channel]
 
-    # Only expand playlist-like URLs.
-    if not any(token in url.lower() for token in ('.m3u8', '.m3u', 'playlist', 'manifest')):
+    # Only expand playlist-like URLs (path, query, or common tokens).
+    if not (
+        looks_like_hls_url(url)
+        or any(token in url.lower() for token in ('.m3u', 'playlist', 'manifest', '.mpd'))
+    ):
         return [channel]
 
     try:
@@ -342,12 +351,36 @@ def maybe_expand_channel(channel, depth=0):
         if not content:
             return [channel]
 
-        # Master playlist with variant streams.
-        if '#EXT-X-STREAM-INF:' in content:
+        # Nested *channel* playlist (EXTINF entries) — always collect these.
+        if '#EXTINF:' in content:
+            children = []
+            for entry in parse_m3u_channels(content, url):
+                child = dict(channel)
+                child.update({k: v for k, v in entry.items() if v not in (None, "")})
+                child['url'] = entry.get('url') or child.get('url')
+                child.setdefault('variant_of', channel.get('url'))
+                child['audio_language'] = (
+                    child.get('audio_language')
+                    or infer_language_code(child.get('url') or '')
+                )
+                children.append(child)
+            if not children:
+                return [channel]
+            expanded = []
+            for child in children:
+                expanded.extend(
+                    maybe_expand_channel(child, depth + 1, expand_variants=expand_variants)
+                )
+            return expanded
+
+        # Master playlist with variant streams (optional — multiplies rows).
+        if expand_variants and '#EXT-X-STREAM-INF:' in content:
             variants = expand_master_manifest(channel, content, url)
             expanded = []
             for variant in variants:
-                expanded.extend(maybe_expand_channel(variant, depth + 1))
+                expanded.extend(
+                    maybe_expand_channel(variant, depth + 1, expand_variants=expand_variants)
+                )
             return expanded[:MAX_VARIANTS_PER_CHANNEL]
 
         # Nested playlist that points to more links in plain text.
@@ -362,7 +395,9 @@ def maybe_expand_channel(channel, depth=0):
                 children.append(child)
             expanded = []
             for child in children:
-                expanded.extend(maybe_expand_channel(child, depth + 1))
+                expanded.extend(
+                    maybe_expand_channel(child, depth + 1, expand_variants=expand_variants)
+                )
             return expanded[:MAX_VARIANTS_PER_CHANNEL]
 
         return [channel]
@@ -370,11 +405,44 @@ def maybe_expand_channel(channel, depth=0):
         return [channel]
 
 
+def _looks_like_channel_index_playlist(url: str) -> bool:
+    """True for M3U *indexes* that list more channels (not a live media playlist)."""
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    try:
+        path = (urllib.parse.urlsplit(raw).path or "").lower()
+    except Exception:
+        path = raw.lower()
+    # Media playlists / masters are almost always .m3u8 — don't re-fetch those
+    # during every ingest (that would be one GET per stream).
+    if path.endswith(".m3u8"):
+        return False
+    if path.endswith(".m3u"):
+        return True
+    name = path.rsplit("/", 1)[-1]
+    return name in {
+        "playlist.m3u",
+        "channels.m3u",
+        "index.m3u",
+        "list.m3u",
+        "tv.m3u",
+    }
+
+
 def expand_channel_for_ingest(channel):
-    """Apply maybe_expand_channel only when IPTV_EXPAND_ON_INGEST is enabled."""
-    if not EXPAND_ON_INGEST:
-        return [channel]
-    return maybe_expand_channel(channel)
+    """Expand nested channel indexes; optionally explode HLS variants.
+
+    Default ingest always unwraps ``.m3u`` channel indexes so we don't store a
+    playlist URL as a fake channel. Full master-variant explosion stays behind
+    ``IPTV_EXPAND_ON_INGEST`` (expensive).
+    """
+    url = channel.get("url") or ""
+    if EXPAND_ON_INGEST:
+        return maybe_expand_channel(channel, expand_variants=True)
+    if _looks_like_channel_index_playlist(url):
+        return maybe_expand_channel(channel, expand_variants=False)
+    return [channel]
 
 
 def check_all_global_sources():
@@ -435,7 +503,6 @@ def check_all_global_sources():
             content = load_playlist_text(source_url)
             if content:
                 source_channels = []
-                current_channel = {}
                 plain_links = parse_url_list_content(content)
                 if plain_links and '#EXTINF:' not in content:
                     for plain_url in plain_links:
@@ -452,60 +519,31 @@ def check_all_global_sources():
                                 'country': infer_country({}, source_url),
                                 'audio_language': infer_language_code(plain_url),
                             }
-                            expanded_plain = expand_channel_for_ingest(plain_channel)
-                            for ex in expanded_plain:
+                            for ex in expand_channel_for_ingest(plain_channel):
                                 ex_url = ex.get('url')
                                 if ex_url and ex_url not in seen_urls:
                                     source_channels.append(ex)
                                     seen_urls.add(ex_url)
+                else:
+                    for entry in parse_m3u_channels(content, source_url):
+                        url = (entry.get('url') or '').strip()
+                        if not url or url in seen_urls:
+                            continue
+                        entry.setdefault('playing_now', 'Not available')
+                        entry.setdefault('status', 'unknown')
+                        entry.setdefault('group_title', 'Unknown')
+                        entry['country'] = infer_country(entry, source_url, live=True)
+                        entry['audio_language'] = (
+                            entry.get('audio_language')
+                            or infer_language_code(source_url)
+                            or infer_language_code(url)
+                        )
+                        for ex in expand_channel_for_ingest(entry):
+                            ex_url = ex.get('url')
+                            if ex_url and ex_url not in seen_urls:
+                                source_channels.append(ex)
+                                seen_urls.add(ex_url)
 
-                for line in content.split('\n'):
-                    line = line.strip()
-                    if line.startswith('#EXTINF:'):
-                        # Parse channel info
-                        parts = line.split(',')
-                        if len(parts) > 1:
-                            current_channel['name'] = parts[-1].strip()
-
-                        # Parse attributes
-                        attr_part = parts[0]
-                        for attr in attr_part.split():
-                            if attr.startswith('tvg-name='):
-                                current_channel['name'] = attr.split('=')[1].strip('"')
-                            elif attr.startswith('tvg-logo='):
-                                current_channel['tvg_logo'] = attr.split('=')[1].strip('"')
-                            elif attr.startswith('tvg-id='):
-                                current_channel['tvg_id'] = attr.split('=')[1].strip('"')
-                            elif attr.startswith('group-title='):
-                                current_channel['group_title'] = attr.split('=')[1].strip('"')
-                            elif attr.startswith('channel-id='):
-                                current_channel['tvg_id'] = attr.split('=')[1].strip('"')
-
-                    elif line.startswith('http') and current_channel:
-                        url = line.strip()
-
-                        # Skip if we've already seen this URL (deduplication)
-                        if url not in seen_urls:
-                            current_channel['url'] = url
-                            current_channel['playing_now'] = 'Not available'
-                            current_channel['status'] = 'unknown'
-                            current_channel['country'] = infer_country(current_channel, source_url)
-                            current_channel['audio_language'] = infer_language_code(source_url) or infer_language_code(url)
-
-                            # Add source prefix to group for tracking
-                            if 'group_title' not in current_channel:
-                                current_channel['group_title'] = 'Unknown'
-
-                            expanded_channels = expand_channel_for_ingest(current_channel.copy())
-                            for ex in expanded_channels:
-                                ex_url = ex.get('url')
-                                if ex_url and ex_url not in seen_urls:
-                                    source_channels.append(ex)
-                                    seen_urls.add(ex_url)
-
-                        current_channel = {}
-
-                # Add source channels to main list
                 all_channels.extend(source_channels)
                 source_stats[source_url] = len(source_channels)
                 logging.debug("Added %s channels from %s", len(source_channels), source_url)

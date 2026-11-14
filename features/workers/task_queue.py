@@ -218,13 +218,35 @@ else:
             initial_delay: float = 0.0,
             **kwargs: Any,
         ) -> asyncio.Task:
-            """Schedule ``name`` to run every ``interval_sec`` seconds.
+            """Run ``name`` every ``interval_sec``, waiting for each run to finish.
 
-            The returned :class:`asyncio.Task` can be cancelled to stop
-            further enqueues (already-running jobs are unaffected).
+            Earlier this only *enqueued* on an interval, so slow jobs (ingest /
+            health) stacked up, starved the queue, and locked SQLite while the
+            site tried to load. We now run one instance at a time and sleep
+            *after* it completes. A second ``schedule_repeat`` for the same
+            ``name`` on this client is ignored (returns the existing task).
             """
             if name not in _REGISTRY:
                 raise KeyError(f"task not registered: {name}")
+            existing = getattr(self, "_sched_by_name", None)
+            if existing is None:
+                self._sched_by_name = {}
+                existing = self._sched_by_name
+            prev = existing.get(name)
+            if prev is not None and not prev.done():
+                self._log.warning("schedule_repeat: %s already scheduled; ignoring duplicate", name)
+                return prev
+
+            fn = _REGISTRY[name]
+
+            async def _run_once() -> None:
+                if inspect.iscoroutinefunction(fn):
+                    await fn(*args, **kwargs)
+                else:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None, functools.partial(fn, *args, **kwargs)
+                    )
 
             async def _loop() -> None:
                 if initial_delay > 0:
@@ -234,16 +256,19 @@ else:
                         return
                 while self._running:
                     try:
-                        await self.delay(name, *args, priority=priority, **kwargs)
-                    except Exception as exc:  # noqa: BLE001
-                        self._log.warning("schedule_repeat: %s enqueue failed: %s", name, exc)
+                        await _run_once()
+                    except asyncio.CancelledError:
+                        return
+                    except Exception:  # noqa: BLE001
+                        self._log.exception("schedule_repeat: %s failed", name)
                     try:
-                        await asyncio.sleep(interval_sec)
+                        await asyncio.sleep(max(1.0, float(interval_sec)))
                     except asyncio.CancelledError:
                         return
 
             t = asyncio.create_task(_loop(), name=f"fw-sched-{name}")
             self._scheduled.append(t)
+            existing[name] = t
             return t
 
         async def _worker_loop(self, idx: int) -> None:

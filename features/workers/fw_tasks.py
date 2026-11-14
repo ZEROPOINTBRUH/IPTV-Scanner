@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import time
 from typing import Optional
 
 from . import health_workers
@@ -38,6 +40,9 @@ from .task_queue import Client, TaskPriority, task
 
 
 log = logging.getLogger("fw_tasks")
+
+# Set by ``main`` / admin purge so the first ingest starts quickly after a wipe.
+REQUEST_FRESH_INGEST = False
 
 
 # ---------------------------------------------------------------------------
@@ -74,10 +79,26 @@ async def discover_playlist(seed_url: str) -> dict:
     )
 
 
+@task("geo_backfill_batch", priority=TaskPriority.LOW)
+async def geo_backfill_batch(limit: Optional[int] = None) -> dict:
+    """Resolve host country for channels still marked GLOBAL / blank."""
+    return await health_workers.run_geo_backfill_batch(
+        get_default_store(), limit=limit,
+    )
+
+
 @task("epg_refresh", priority=TaskPriority.LOW)
 async def epg_refresh() -> dict:
     """Placeholder EPG refresh — reserved for the Phase 3 EPG pipeline."""
     return await health_workers.run_epg_refresh(get_default_store())
+
+
+@task("verify_channel", priority=TaskPriority.HIGH)
+async def verify_channel(url: str, reason: str = "") -> dict:
+    """Validate one channel now (crowd reports: alive / no_playback / slow_load)."""
+    return await health_workers.run_verify_channel(
+        url, get_default_store(), reason=reason,
+    )
 
 
 @task("icon_prefetch_batch", priority=TaskPriority.LOW)
@@ -109,12 +130,16 @@ async def schedule_defaults(client: Client) -> list[asyncio.Task]:
     equivalent primitive.
     """
     scheduled: list[asyncio.Task] = []
+    fresh = bool(REQUEST_FRESH_INGEST)
+    # After a purge, pull sources almost immediately, then health-check.
+    ingest_delay = 2.0 if fresh else 8.0
+    health_delay = 6.0 if fresh else 5.0
     scheduled.append(
         client.schedule_repeat(
             "active_health_batch",
             health_workers.ACTIVE_HEALTH_INTERVAL_SEC,
             priority=TaskPriority.HIGH,
-            initial_delay=5.0,
+            initial_delay=health_delay,
         )
     )
     scheduled.append(
@@ -130,7 +155,9 @@ async def schedule_defaults(client: Client) -> list[asyncio.Task]:
             "ingest_sources",
             health_workers.INGEST_INTERVAL_SEC,
             priority=TaskPriority.NORMAL,
-            initial_delay=0.0,
+            # Let Waitress bind and serve the first page before the big upsert
+            # (shortened when REQUEST_FRESH_INGEST is set after a purge).
+            initial_delay=ingest_delay,
         )
     )
     scheduled.append(
@@ -143,6 +170,14 @@ async def schedule_defaults(client: Client) -> list[asyncio.Task]:
     )
     scheduled.append(
         client.schedule_repeat(
+            "geo_backfill_batch",
+            health_workers.GEO_BACKFILL_INTERVAL_SEC,
+            priority=TaskPriority.LOW,
+            initial_delay=45.0,
+        )
+    )
+    scheduled.append(
+        client.schedule_repeat(
             "epg_refresh",
             health_workers.EPG_REFRESH_INTERVAL_SEC,
             priority=TaskPriority.LOW,
@@ -151,6 +186,83 @@ async def schedule_defaults(client: Client) -> list[asyncio.Task]:
     )
     log.info("fw_tasks: scheduled %d repeating cadences", len(scheduled))
     return scheduled
+
+
+# ---------------------------------------------------------------------------
+# Enqueue from non-async callers (Flask request threads)
+# ---------------------------------------------------------------------------
+
+_active_client: Optional[Client] = None
+_active_loop: Optional[asyncio.AbstractEventLoop] = None
+_verify_recent: dict[str, float] = {}
+_verify_lock = threading.Lock()
+VERIFY_DEDUPE_SEC = 30.0
+
+
+def register_client(client: Client, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+    """Remember the running client + its loop so :func:`enqueue` can reach it."""
+    global _active_client, _active_loop
+    _active_client = client
+    _active_loop = loop or asyncio.get_running_loop()
+
+
+def enqueue(
+    name: str,
+    *args,
+    priority: TaskPriority = TaskPriority.HIGH,
+    **kwargs,
+) -> bool:
+    """Thread-safe ``client.delay`` for Flask threads; ``False`` when no queue is running."""
+    client, loop = _active_client, _active_loop
+    if client is None or loop is None or loop.is_closed() or not loop.is_running():
+        return False
+
+    async def _put() -> None:
+        try:
+            await client.delay(name, *args, priority=priority, **kwargs)
+        except TypeError:  # backend without a priority kwarg
+            await client.delay(name, *args, **kwargs)
+
+    try:
+        asyncio.run_coroutine_threadsafe(_put(), loop).result(timeout=2.0)
+        return True
+    except Exception:  # noqa: BLE001
+        log.warning("enqueue(%s) failed", name, exc_info=True)
+        return False
+
+
+def _verify_in_thread(url: str, reason: str) -> None:
+    """Fallback when no queue is running: private event loop in a plain thread."""
+
+    def _run() -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(
+                health_workers.run_verify_channel(url, get_default_store(), reason=reason)
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("verify thread failed for %s", url, exc_info=True)
+        finally:
+            loop.close()
+
+    threading.Thread(target=_run, name="verify-channel", daemon=True).start()
+
+
+def enqueue_verify(url: str, reason: str = "") -> str:
+    """Queue a ``verify_channel`` task. Returns ``queue`` | ``thread`` | ``deduped``."""
+    now = time.monotonic()
+    with _verify_lock:
+        if len(_verify_recent) > 2048:
+            for k in [k for k, t in _verify_recent.items() if now - t > VERIFY_DEDUPE_SEC]:
+                _verify_recent.pop(k, None)
+        last = _verify_recent.get(url)
+        if last is not None and now - last < VERIFY_DEDUPE_SEC:
+            return "deduped"
+        _verify_recent[url] = now
+    if enqueue("verify_channel", url, reason=reason):
+        return "queue"
+    _verify_in_thread(url, reason)
+    return "thread"
 
 
 async def bootstrap(
@@ -168,6 +280,7 @@ async def bootstrap(
     """
     client = build_client(worker_count=worker_count)
     await client.start()
+    register_client(client, asyncio.get_running_loop())
     await schedule_defaults(client)
     task_queue.print_access_banner(bind_host, port, public_base=public_base)
     return client
@@ -180,6 +293,11 @@ __all__ = [
     "discover_playlist",
     "epg_refresh",
     "icon_prefetch_batch",
+    "geo_backfill_batch",
+    "verify_channel",
+    "enqueue",
+    "enqueue_verify",
+    "register_client",
     "build_client",
     "schedule_defaults",
     "bootstrap",

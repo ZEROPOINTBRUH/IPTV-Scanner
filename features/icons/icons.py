@@ -15,14 +15,14 @@ from features.ingest.ingest import channel_icon_safe_name, find_local_icon_url, 
 
 
 def download_channel_icon(channel_name, channel_url, tvg_logo):
-    """Download and cache channel logo under webroot/icons; serve locally after first scrape."""
+    """Download and cache channel logo under static/icons; serve locally after first scrape."""
     try:
         safe_name = channel_icon_safe_name(channel_name)
         cached_url = find_local_icon_url(safe_name)
         if cached_url:
             return cached_url
 
-        base = f'webroot/icons/{safe_name}'
+        base = f'static/icons/{safe_name}'
 
         def save_image_bytes(content, content_type, ref_url):
             if not content or len(content) < 80:

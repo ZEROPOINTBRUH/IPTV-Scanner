@@ -64,18 +64,20 @@ _TEST_NAME_MARKERS = (
 
 _TEST_GROUPS = frozenset({"test", "tests", "sample", "samples", "demo", "demos"})
 
-_VOD_URL_TOKENS = (
-    ".mp4",
-    ".mkv",
-    ".mov",
-    ".webm",
-    ".avi",
-    "/vod/",
+# Path suffixes that mean a progressive on-demand file (not an HLS live loop).
+_VOD_FILE_SUFFIXES = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".mpg", ".mpeg")
+
+# Path segments that strongly suggest a VOD catalog entry (not a 24/7 loop).
+_VOD_PATH_MARKERS = (
     "/movies/",
     "/movie/",
     "/series/",
     "/episodes/",
     "/episode/",
+    "/film/",
+    "/films/",
+    "/vod/movie",
+    "/vod/series",
 )
 
 _LIVE_URL_TOKENS = (
@@ -88,6 +90,10 @@ _LIVE_URL_TOKENS = (
     "master.m3u8",
     "index.m3u8",
     "chunklist",
+    "/hls/",
+    "youtu.be/",
+    "youtube.com/",
+    "twitch.tv/",
 )
 
 
@@ -231,42 +237,84 @@ def normalize_group_title(channel: dict) -> str:
     return primary
 
 
+def _url_path_lower(url: str) -> str:
+    try:
+        return (urllib.parse.urlparse(url).path or "").lower()
+    except Exception:
+        return ""
+
+
+def _is_progressive_vod_file(url: str) -> bool:
+    """True only for real media files, not ``.mp4.m3u8`` or hostnames like ``mov3.co``."""
+    path = _url_path_lower(url)
+    if not path:
+        return False
+    # HLS/DASH always win over a substring like ``.mp4`` inside the path.
+    if path.endswith(".m3u8") or path.endswith(".m3u") or path.endswith(".mpd"):
+        return False
+    return any(path.endswith(ext) for ext in _VOD_FILE_SUFFIXES)
+
+
 def classify_media_type(
     content_or_url: Optional[str],
     playlist_text: Optional[str] = None,
 ) -> str:
     """Best-effort classification of a stream as ``live``, ``vod``, or ``unknown``.
 
-    ``content_or_url`` is normally the channel URL. ``playlist_text`` is the
-    optional body of the fetched playlist. When both are provided the playlist
-    body wins because HLS manifests are authoritative.
+    HLS/DASH playlists (including looping playlists with ``#EXT-X-ENDLIST``) stay
+    ``live`` so 24/7 loops are not dumped into the Videos section. ``vod`` is for
+    progressive files and clearly on-demand catalog paths.
+
+    YouTube / Twitch links in this IPTV catalog are treated as ``live`` (many are
+    24/7 news lives behind a watch URL). Validation can demote offline ones later.
     """
+    if not content_or_url and not playlist_text:
+        return "unknown"
+
+    url = str(content_or_url or "").strip()
+    low = url.lower()
+
+    if low and ("youtube.com/" in low or "youtu.be/" in low or "twitch.tv/" in low):
+        return "live"
+
+    path = _url_path_lower(url)
+    try:
+        from features.ingest.m3u_parse import looks_like_dash_url, looks_like_hls_url
+
+        hls_like = looks_like_hls_url(url)
+        dash_like = looks_like_dash_url(url)
+    except Exception:
+        hls_like = path.endswith(".m3u8") or path.endswith(".m3u") or ".m3u8" in low
+        dash_like = path.endswith(".mpd") or ".mpd" in low
+
+    if hls_like or dash_like or path.endswith(".m3u8") or path.endswith(".m3u") or path.endswith(".mpd"):
+        # Playlist body: EVENT/live tags → live. ENDLIST alone is often a
+        # looping "live" channel — keep it in Live TV, not Videos.
+        if playlist_text:
+            text = playlist_text
+            if re.search(r"#EXT-X-PLAYLIST-TYPE\s*:\s*EVENT", text, re.IGNORECASE):
+                return "live"
+            if re.search(r"#EXT-X-PLAYLIST-TYPE\s*:\s*VOD", text, re.IGNORECASE):
+                if any(m in path for m in _VOD_PATH_MARKERS):
+                    return "vod"
+                return "live"
+            if "#EXTM3U" in text or "#EXT-X-STREAM-INF" in text or "#EXTINF" in text:
+                return "live"
+        return "live"
+
+    if _is_progressive_vod_file(url):
+        return "vod"
+    if path and any(m in path for m in _VOD_PATH_MARKERS):
+        return "vod"
+
+    for token in _LIVE_URL_TOKENS:
+        if token in low:
+            return "live"
+
     if playlist_text:
         text = playlist_text
-        if "#EXT-X-ENDLIST" in text:
-            return "vod"
-        if re.search(r"#EXT-X-PLAYLIST-TYPE\s*:\s*VOD", text, re.IGNORECASE):
-            return "vod"
-        if re.search(r"#EXT-X-PLAYLIST-TYPE\s*:\s*EVENT", text, re.IGNORECASE):
-            return "live"
         if "#EXTM3U" in text or "#EXT-X-STREAM-INF" in text or "#EXTINF" in text:
             return "live"
-
-    if not content_or_url:
-        return "unknown"
-
-    url = str(content_or_url).strip().lower()
-    if not url:
-        return "unknown"
-
-    for token in _VOD_URL_TOKENS:
-        if token in url:
-            return "vod"
-    for token in _LIVE_URL_TOKENS:
-        if token in url:
-            return "live"
-    if url.endswith(".m3u8") or url.endswith(".mpd"):
-        return "live"
 
     return "unknown"
 

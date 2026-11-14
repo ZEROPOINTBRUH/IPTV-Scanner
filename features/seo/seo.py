@@ -179,16 +179,24 @@ def build_proxied_live_m3u(
     lines = ["#EXTM3U"]
     try:
         from features.storage.db import get_default_store
-        result = get_default_store().list_channels(
-            page=1,
-            limit=100000,
-            country=country or None,
-            group=group or None,
-            include_test=include_test,
-            media_type=media_type,
-            status="online" if online_only else "online",
-        )
-        channels = result.get("channels") or []
+        store = get_default_store()
+        channels = []
+        page = 1
+        # list_channels caps a single page at 1000 rows; walk every page.
+        while True:
+            result = store.list_channels(
+                page=page,
+                limit=1000,
+                country=country or None,
+                group=group or None,
+                include_test=include_test,
+                media_type=media_type,
+                status="online",
+            )
+            channels.extend(result.get("channels") or [])
+            if not result.get("has_more"):
+                break
+            page += 1
     except Exception:
         channels = get_valid_channels()
     for ch in channels:

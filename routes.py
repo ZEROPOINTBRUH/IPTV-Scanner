@@ -6,11 +6,13 @@ handler to the singleton :data:`app_factory.app`.
 
 import asyncio
 import datetime
+import hashlib
 import json
 import logging
 import mimetypes
 import os
 import re
+import secrets
 import threading
 import time
 import urllib.parse
@@ -36,14 +38,27 @@ from app_factory import app
 from features.storage.channels_io import get_valid_channels
 from config import (
     HEADERS,
+    IPTV_ADMIN_PASSWORD,
+    IPTV_ADMIN_PURGE_COOLDOWN_SEC,
     IPTV_PLAYLIST_SECRET,
+    IPTV_PROXY_CONNECT_TIMEOUT,
+    IPTV_PROXY_MAX_CONCURRENT,
     IPTV_SITE_NAME,
+    IPTV_WAITRESS_THREADS,
     STREAM_HEADERS,
     SWEEP_INTERVAL_SEC,
 )
+from features.public_api import (
+    check_admin_purge_rate_limit,
+    check_channels_rate_limit,
+    check_proxy_rate_limit,
+    check_report_rate_limit,
+    client_ip,
+    client_ip,
+)
 from features.storage.geo import resolve_country_code
 from features.icons.icons import download_channel_icon
-from features.ingest.ingest import channel_icon_safe_name, find_local_icon_url, infer_country
+from features.ingest.ingest import infer_country, resolve_channel_icon_urls
 from features.seo.seo import (
     SEO_RESERVED_SLUGS,
     SEO_SLUG_RE,
@@ -56,6 +71,61 @@ from features.seo.seo import (
     seo_refresh_slug_index,
     seo_slug_snapshot,
 )
+
+
+# --- Shared helpers: concurrency slots, request payloads ----------------------
+
+class _Slot:
+    """One held permit of a BoundedSemaphore; ``release`` is idempotent."""
+
+    __slots__ = ("_sem", "_lock", "_held")
+
+    def __init__(self, sem: threading.BoundedSemaphore) -> None:
+        self._sem = sem
+        self._lock = threading.Lock()
+        self._held = True
+
+    @classmethod
+    def try_acquire(cls, sem: threading.BoundedSemaphore):
+        return cls(sem) if sem.acquire(blocking=False) else None
+
+    def release(self) -> None:
+        with self._lock:
+            if not self._held:
+                return
+            self._held = False
+        self._sem.release()
+
+
+# Cap simultaneous upstream pulls through /proxy/stream (IPTV_PROXY_MAX_CONCURRENT).
+_PROXY_SLOTS = threading.BoundedSemaphore(IPTV_PROXY_MAX_CONCURRENT)
+# Each SSE client pins a server thread, so keep half the pool free for normal requests.
+_SSE_SLOTS = threading.BoundedSemaphore(max(2, IPTV_WAITRESS_THREADS // 2))
+SSE_MAX_LIFETIME_SEC = 300  # EventSource reconnects on its own after the stream ends
+SSE_RETRY_MS = 5000
+PROXY_RETRY_AFTER_SEC = 3
+
+
+def _busy_response(message: str, retry_after: int = PROXY_RETRY_AFTER_SEC):
+    resp = jsonify({'ok': False, 'error': message, 'retry_after': retry_after})
+    resp.status_code = 503
+    resp.headers['Retry-After'] = str(retry_after)
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+def _request_payload() -> dict:
+    """JSON body (or form / query fallback) as a plain dict."""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in ('url', 'event', 'session_id', 'load_ms'):
+        if payload.get(key) is None:
+            val = request.form.get(key) or request.args.get(key)
+            if val is not None:
+                payload[key] = val
+    return payload
 
 
 # --- SEO endpoints ------------------------------------------------------------
@@ -270,7 +340,18 @@ def api_variants():
         return jsonify({'variants': [], 'error': str(e)})
 
 
+def _enqueue_verify(url: str, reason: str) -> str:
+    """Queue a ``verify_channel`` task (thread fallback when no queue is running)."""
+    try:
+        from features.workers import fw_tasks
+        return fw_tasks.enqueue_verify(url, reason)
+    except Exception:
+        logging.debug('enqueue verify failed', exc_info=True)
+        return 'failed'
+
+
 @app.route('/api/report-alive', methods=['POST'])
+@app.route('/api/v1/report-alive', methods=['POST'])
 def api_report_alive():
     """Crowd-promote a channel after a client successfully plays it.
 
@@ -278,11 +359,14 @@ def api_report_alive():
     ``online`` immediately so other users see them in the live list right away.
     A background verify then confirms (or demotes) the stream.
     """
+    limited = check_report_rate_limit()
+    if limited is not None:
+        return limited
     try:
         from features.storage.db import get_default_store
 
-        payload = request.get_json(silent=True) or {}
-        url = (payload.get('url') or request.form.get('url') or request.args.get('url') or '').strip()
+        payload = _request_payload()
+        url = str(payload.get('url') or '').strip()
         if not url:
             return jsonify({'ok': False, 'error': 'url required'}), 400
 
@@ -303,36 +387,11 @@ def api_report_alive():
         }])
         # Crowd-reported plays jump the health queue (unchecked-first).
         try:
-            store.mark_priority_check(url)
+            store.mark_priority_check(url, 100)
         except Exception:
             logging.debug('mark_priority_check failed', exc_info=True)
 
-        def _bg_verify():
-            try:
-                async def _run():
-                    import aiohttp
-                    from features.validate.validate import validate_channel
-
-                    ch = store.get_channel(url)
-                    if not ch:
-                        return
-                    timeout = aiohttp.ClientTimeout(total=30)
-                    connector = aiohttp.TCPConnector(ssl=False, limit=4)
-                    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                        channel, ok = await validate_channel(session, dict(ch))
-                    store.update_channel_results([{
-                        'url': url,
-                        'status': 'online' if ok else (channel.get('status') or 'offline'),
-                        'playing_now': channel.get('playing_now'),
-                        'fail_reason': None if ok else (channel.get('playing_now') or 'verify failed'),
-                        'fail_count': 0 if ok else 1,
-                    }])
-
-                asyncio.run(_run())
-            except Exception:
-                logging.debug('report-alive verify failed', exc_info=True)
-
-        threading.Thread(target=_bg_verify, daemon=True).start()
+        verify = _enqueue_verify(url, 'alive')
 
         rev = store.get_revision()
         state.CHANNEL_STATE_REVISION = rev
@@ -342,6 +401,7 @@ def api_report_alive():
             'previous_status': prev,
             'status': 'online',
             'priority_check_queued': True,
+            'verify': verify,
             'revision': rev,
             'message': (
                 'Marked online and queued for a priority health check.'
@@ -351,6 +411,106 @@ def api_report_alive():
         })
     except Exception as e:
         logging.error('report-alive failed: %s', e)
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+PLAYBACK_EVENTS = {
+    # event -> check_priority handed to mark_priority_check
+    'no_playback': 90,
+    'slow_load': 20,
+}
+
+
+@app.route('/api/report-playback', methods=['POST'])
+@app.route('/api/v1/report-playback', methods=['POST'])
+def api_report_playback():
+    """Client-side playback problem report: ``{url, event, load_ms?}``.
+
+    ``no_playback`` bumps the channel to the front of the health queue and
+    queues a verify task; the stream is NOT flipped offline here (only a failed
+    verify can do that). ``slow_load`` just raises its check priority a little.
+    """
+    limited = check_report_rate_limit()
+    if limited is not None:
+        return limited
+    try:
+        from features.storage.db import get_default_store
+
+        payload = _request_payload()
+        url = str(payload.get('url') or '').strip()
+        event = str(payload.get('event') or '').strip().lower()
+        if not url:
+            return jsonify({'ok': False, 'error': 'url required'}), 400
+        if event not in PLAYBACK_EVENTS:
+            return jsonify({
+                'ok': False,
+                'error': 'event must be one of: ' + ', '.join(sorted(PLAYBACK_EVENTS)),
+            }), 400
+        load_ms = None
+        if payload.get('load_ms') is not None:
+            try:
+                load_ms = max(0, int(float(payload['load_ms'])))
+            except (TypeError, ValueError):
+                return jsonify({'ok': False, 'error': 'load_ms must be a number'}), 400
+
+        store = get_default_store()
+        existing = store.get_channel(url)
+        if not existing:
+            return jsonify({'ok': False, 'error': 'unknown channel'}), 404
+
+        queued = store.mark_priority_check(url, PLAYBACK_EVENTS[event])
+        verify = _enqueue_verify(url, event) if event == 'no_playback' else None
+
+        rev = store.get_revision()
+        state.CHANNEL_STATE_REVISION = rev
+        return jsonify({
+            'ok': True,
+            'event': event,
+            'load_ms': load_ms,
+            'status': (existing.get('status') or 'unknown').lower(),
+            'priority_check_queued': bool(queued),
+            'verify': verify,
+            'revision': rev,
+        })
+    except Exception as e:
+        logging.error('report-playback failed: %s', e)
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/v1/watching', methods=['POST'])
+@app.route('/api/watching', methods=['POST'])
+def api_watching():
+    """Viewer heartbeat: ``{url, session_id?}`` -> current viewers for that channel."""
+    limited = check_report_rate_limit()
+    if limited is not None:
+        return limited
+    try:
+        from features.storage.db import get_default_store
+
+        payload = _request_payload()
+        url = str(payload.get('url') or '').strip()
+        if not url:
+            return jsonify({'ok': False, 'error': 'url required'}), 400
+
+        store = get_default_store()
+        if not store.get_channel(url):
+            return jsonify({'ok': False, 'error': 'unknown channel'}), 404
+
+        session_id = re.sub(r'[^A-Za-z0-9._:-]', '', str(payload.get('session_id') or ''))[:128]
+        if not session_id:
+            # Anonymous client: stable per ip + browser so repeat beats reuse one row.
+            fingerprint = f"{client_ip()}|{request.headers.get('User-Agent', '')}"
+            session_id = 'anon-' + hashlib.sha1(fingerprint.encode('utf-8', 'replace')).hexdigest()[:24]
+
+        store.heartbeat_viewer(session_id, url)
+        return jsonify({
+            'ok': True,
+            'url': url,
+            'session_id': session_id,
+            'viewers': store.count_viewers(url),
+        })
+    except Exception as e:
+        logging.error('watching failed: %s', e)
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
@@ -385,13 +545,15 @@ def get_status():
     try:
         from features.storage.db import get_default_store
         store = get_default_store()
-        total = store.count_channels(status="online", exclude_test=True)
+        counts = store.status_counts(exclude_test=True)
+        total = counts['online']
         online_ct = total
         rev = store.get_revision()
         state.CHANNEL_STATE_REVISION = rev
         return jsonify({
             'total_channels': total,
             'online_channels': online_ct,
+            'counts': counts,
             'scanning': state.SCAN_ACTIVE,
             'revision': rev,
             'sweep_interval_sec': SWEEP_INTERVAL_SEC,
@@ -406,40 +568,56 @@ def get_status():
 
 @app.route('/api/events')
 def sse_channel_events():
-    """Server-Sent Events: channel list revision and counts (for smooth live UI updates)."""
+    """Server-Sent Events: revision + status counts (small payload, client reconnects).
+
+    Each stream pins one server thread, so the number of concurrent streams is
+    capped and every stream ends after ``SSE_MAX_LIFETIME_SEC``; browsers
+    (EventSource) simply reconnect, honouring the ``retry:`` hint.
+    """
+    slot = _Slot.try_acquire(_SSE_SLOTS)
+    if slot is None:
+        return _busy_response('too many event streams', retry_after=SSE_RETRY_MS // 1000)
+
     def event_stream():
         last_rev = -1
-        while True:
-            try:
-                from features.storage.db import get_default_store
-                store = get_default_store()
-                rev = store.get_revision()
-                if rev != last_rev:
-                    last_rev = rev
-                    state.CHANNEL_STATE_REVISION = rev
-                    total = store.count_channels(status="online", exclude_test=True)
-                    payload = json.dumps({
-                        'revision': rev,
-                        'total_channels': total,
-                        'online_channels': total,
-                        'scanning': state.SCAN_ACTIVE,
-                    })
-                    yield f"data: {payload}\n\n"
-                else:
-                    yield ": ping\n\n"
-            except Exception as err:
-                yield f"data: {json.dumps({'error': str(err)})}\n\n"
-            time.sleep(2)
+        started = time.monotonic()
+        try:
+            yield f"retry: {SSE_RETRY_MS}\n\n"
+            while time.monotonic() - started < SSE_MAX_LIFETIME_SEC:
+                try:
+                    from features.storage.db import get_default_store
+                    store = get_default_store()
+                    rev = store.get_revision()
+                    if rev != last_rev:
+                        last_rev = rev
+                        state.CHANNEL_STATE_REVISION = rev
+                        counts = store.status_counts(exclude_test=True)
+                        payload = json.dumps({
+                            'revision': rev,
+                            'total_channels': counts['online'],
+                            'online_channels': counts['online'],
+                            'counts': counts,
+                            'scanning': state.SCAN_ACTIVE,
+                        }, separators=(',', ':'))
+                        yield f"data: {payload}\n\n"
+                    else:
+                        yield ": ping\n\n"
+                except Exception as err:
+                    yield f"data: {json.dumps({'error': str(err)})}\n\n"
+                time.sleep(2)
+        finally:
+            slot.release()
 
-    return Response(
+    resp = Response(
         stream_with_context(event_stream()),
         mimetype='text/event-stream',
         headers={
             'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
             'X-Accel-Buffering': 'no',
         },
     )
+    resp.call_on_close(slot.release)  # covers streams that never start iterating
+    return resp
 
 
 # --- Icons --------------------------------------------------------------------
@@ -448,7 +626,7 @@ def sse_channel_events():
 def serve_icon(filename):
     """Serve cached channel icons."""
     try:
-        icon_path = f'webroot/icons/{filename}'
+        icon_path = f'static/icons/{filename}'
         if os.path.exists(icon_path):
             mt = mimetypes.guess_type(icon_path)[0] or 'image/png'
             return send_file(icon_path, mimetype=mt)
@@ -521,20 +699,13 @@ def get_channel_info_endpoint(channel_name):
 
 @app.route('/scan')
 def trigger_scan():
-    """Enqueue ingest + health via the task queue."""
+    """Enqueue ingest + health on the shared task queue (no second Client)."""
     try:
-        def _kick():
-            async def _run():
-                from features.workers import fw_tasks
-                from features.workers.task_queue import Client
-                c = Client(worker_count=2, name="scan-kick")
-                await c.start()
-                await c.delay("ingest_sources")
-                await c.delay("active_health_batch")
-                await asyncio.sleep(2)
-                await c.stop()
-            asyncio.run(_run())
-        threading.Thread(target=_kick, daemon=True).start()
+        from features.workers import fw_tasks
+        ok_ingest = fw_tasks.enqueue("ingest_sources")
+        ok_health = fw_tasks.enqueue("active_health_batch")
+        if not (ok_ingest or ok_health):
+            return jsonify({'error': 'task queue not running'}), 503
         return jsonify({'message': 'Ingest queued', 'status': 'scanning'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -542,19 +713,13 @@ def trigger_scan():
 
 @app.route('/sweep-now')
 def trigger_sweep_now():
-    """Enqueue active + dead health batches."""
+    """Enqueue active + dead health batches on the shared task queue."""
     try:
-        def _kick():
-            async def _run():
-                from features.workers.task_queue import Client
-                c = Client(worker_count=2, name="sweep-kick")
-                await c.start()
-                await c.delay("active_health_batch")
-                await c.delay("dead_revival_batch")
-                await asyncio.sleep(2)
-                await c.stop()
-            asyncio.run(_run())
-        threading.Thread(target=_kick, daemon=True).start()
+        from features.workers import fw_tasks
+        ok_a = fw_tasks.enqueue("active_health_batch")
+        ok_d = fw_tasks.enqueue("dead_revival_batch")
+        if not (ok_a or ok_d):
+            return jsonify({'error': 'task queue not running'}), 503
         return jsonify({'message': 'Health check queued', 'status': 'sweeping'}), 202
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -564,7 +729,13 @@ def trigger_sweep_now():
 
 @app.route('/channels')
 def get_channels():
-    """Paginated channel list from SQLite (default page size 50)."""
+    """Paginated channel list from SQLite (default page size 50) for the web guide.
+
+    Third-party clients should use ``/api/v1/channels`` (slim envelope).
+    """
+    limited = check_channels_rate_limit()
+    if limited is not None:
+        return limited
     try:
         from features.storage.db import get_default_store
         store = get_default_store()
@@ -589,7 +760,23 @@ def get_channels():
             status_in = ('pending', 'offline', 'error', 'unknown')
             media_type = None
         sort = (request.args.get('sort') or 'trending').strip()
-        default_dir = 'desc' if sort.lower() in ('trending', 'popular', 'trend_score', 'watch_count') else 'asc'
+        default_dir = (
+            'desc'
+            if sort.lower()
+            in (
+                'trending',
+                'popular',
+                'trend_score',
+                'watch_count',
+                'last_checked_at',
+                'last_checked',
+                'scanned',
+                'recently_scanned',
+                'last_watched_at',
+                'updated_at',
+            )
+            else 'asc'
+        )
         sort_dir = (request.args.get('sort_dir') or default_dir).strip()
 
         result = store.list_channels(
@@ -608,10 +795,9 @@ def get_channels():
         )
         channels = result.get('channels') or []
         for channel in channels:
-            safe_name = channel_icon_safe_name(channel.get('name', ''))
-            local_icon = find_local_icon_url(safe_name)
-            if local_icon:
-                channel['icon_url'] = local_icon
+            icon_url, generic_icon_url = resolve_channel_icon_urls(channel)
+            channel['icon_url'] = icon_url
+            channel['generic_icon_url'] = generic_icon_url
             # Prefer a real ISO code even when the DB still says GLOBAL
             # (many playlists stuffed the country into group-title).
             resolved = resolve_country_code(channel)
@@ -663,6 +849,9 @@ def export_streams_file():
 @app.route('/proxy/image')
 def proxy_image():
     """Proxy image requests with caching and rate limiting."""
+    limited = check_proxy_rate_limit()
+    if limited is not None:
+        return limited
     try:
         image_url = request.args.get('url')
         if not image_url:
@@ -913,8 +1102,13 @@ def get_twitch_stream_url(url):
         if not channel:
             return None
 
-        # Return Twitch embed URL for iframe
-        return f"https://player.twitch.tv/?channel={channel}&parent=localhost&parent=127.0.0.1&autoplay=true"
+        # Embed URL for iframes — parents must match the browsing host.
+        host = (request.host.split(":")[0] if request else "") or "localhost"
+        parents = ["localhost", "127.0.0.1"]
+        if host and host not in parents:
+            parents.insert(0, host)
+        parent_q = "&".join(f"parent={p}" for p in parents)
+        return f"https://player.twitch.tv/?channel={channel}&{parent_q}&autoplay=true"
 
     except Exception as e:
         logging.error(f"Error extracting Twitch URL: {e}")
@@ -973,12 +1167,26 @@ def rewrite_hls_playlist_for_proxy(body: str, resolved_base_url: str) -> str:
 
 @app.route('/proxy/stream')
 def proxy_stream():
-    """Proxy YouTube and Twitch streams to work with HTML5 video player."""
+    """Proxy YouTube and Twitch streams to work with HTML5 video player.
+
+    At most ``IPTV_PROXY_MAX_CONCURRENT`` upstream pulls run at once; extra
+    callers get ``503`` + ``Retry-After``. The slot is held for the whole
+    relay and freed as soon as the client disconnects.
+    """
+    limited = check_proxy_rate_limit()
+    if limited is not None:
+        return limited
+    slot = None
+    handed_off = False  # proxy_direct_stream owns the slot once it is called
     try:
         stream_url = request.args.get('url')
         if not stream_url:
             logging.error("No URL provided to proxy/stream endpoint")
             return jsonify({'error': 'No URL provided'}), 400
+
+        slot = _Slot.try_acquire(_PROXY_SLOTS)
+        if slot is None:
+            return _busy_response('proxy busy, try again shortly')
 
         logging.debug("Proxy stream request for URL: %s", stream_url)
         logging.debug(
@@ -1012,12 +1220,16 @@ def proxy_stream():
         # Direct stream for other sources
         else:
             logging.debug("Processing direct stream URL")
-            return proxy_direct_stream(stream_url)
+            handed_off = True
+            return proxy_direct_stream(stream_url, slot)
 
     except Exception as e:
         logging.error(f"Error proxying stream: {e}")
         logging.error(f"Exception details: {type(e).__name__}: {str(e)}")
         return jsonify({'error': str(e)}), 500
+    finally:
+        if slot is not None and not handed_off:
+            slot.release()
 
 
 def _looks_like_hls_text(text: str) -> bool:
@@ -1025,17 +1237,22 @@ def _looks_like_hls_text(text: str) -> bool:
     return head.startswith("#EXTM3U")
 
 
-def proxy_direct_stream(url):
+def proxy_direct_stream(url, slot=None):
     """Proxy direct streams (progressive passthrough or HLS manifest rewrite + segment relay).
 
     Upstream fetches intentionally omit ``Upgrade-Insecure-Requests`` so plain
     ``http://`` IPTV origins are not coerced onto HTTPS.
+
+    ``slot`` (a held :class:`_Slot`) is released when the response is finished
+    or the client disconnects (the generator is closed), and immediately for
+    short playlist / error responses.
     """
     cors = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "*",
         "Cache-Control": "no-store",
     }
+    streaming = False  # True once the relay generator owns the slot
     try:
         # Prefer treating known playlist URLs as text up-front.
         force_playlist = _url_looks_like_hls_manifest(url)
@@ -1043,7 +1260,8 @@ def proxy_direct_stream(url):
         upstream = requests.get(
             url,
             headers=STREAM_HEADERS,
-            timeout=45 if force_playlist else 120,
+            # (connect, read): bound connect time; reads stay patient for live feeds.
+            timeout=(IPTV_PROXY_CONNECT_TIMEOUT, 45 if force_playlist else 120),
             stream=not force_playlist,
             allow_redirects=True,
         )
@@ -1121,6 +1339,8 @@ def proxy_direct_stream(url):
             )
 
         def generate():
+            # The server closes this generator when the client disconnects, which
+            # drops the upstream connection and frees the proxy slot right away.
             try:
                 if peek:
                     yield peek
@@ -1129,28 +1349,223 @@ def proxy_direct_stream(url):
                         yield chunk
             finally:
                 upstream.close()
+                if slot is not None:
+                    slot.release()
 
-        return Response(
+        resp = Response(
             stream_with_context(generate()),
             content_type=upstream.headers.get("Content-Type", "application/octet-stream"),
             headers=cors,
         )
+        if slot is not None:
+            resp.call_on_close(slot.release)  # also covers a generator that never started
+        streaming = True
+        return resp
 
+    except requests.exceptions.ConnectTimeout:
+        logging.warning("Proxy connect timeout (%.1fs): %s", IPTV_PROXY_CONNECT_TIMEOUT, url)
+        return jsonify({"error": "Upstream connect timeout"}), 504
     except Exception as e:
         logging.error(f"Error proxying direct stream: {e}")
         return jsonify({"error": "Failed to proxy stream"}), 500
+    finally:
+        if slot is not None and not streaming:
+            slot.release()
+
+
+# Successful purge cooldown per client IP (monotonic deadline).
+_purge_cooldown_until: dict[str, float] = {}
+_purge_cooldown_lock = threading.Lock()
+
+
+def _playlist_token_ok() -> bool:
+    """Optional shared-secret gate for playlist backup / full M3U (not purge)."""
+    if not IPTV_PLAYLIST_SECRET:
+        return True
+    token = request.args.get("token") or request.headers.get("X-Admin-Token") or ""
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+        if isinstance(body, dict):
+            token = token or str(body.get("token") or "")
+    try:
+        return secrets.compare_digest(str(token), IPTV_PLAYLIST_SECRET)
+    except (TypeError, ValueError):
+        return False
+
+
+def _extract_admin_password(payload: dict) -> str:
+    """Password from JSON/form/query/header (never trust loopback alone)."""
+    for key in ("password", "token", "admin_password"):
+        val = payload.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    for key in ("password", "token"):
+        val = request.args.get(key) or request.form.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    header = (
+        request.headers.get("X-Admin-Password")
+        or request.headers.get("X-Admin-Token")
+        or ""
+    ).strip()
+    return header
+
+
+def _purge_password_configured() -> bool:
+    return bool(IPTV_ADMIN_PASSWORD)
+
+
+def _purge_password_ok(supplied: str) -> bool:
+    expected = IPTV_ADMIN_PASSWORD
+    if not expected or not supplied:
+        return False
+    # Hash both sides so compare_digest never length-leaks.
+    a = hashlib.sha256(supplied.encode("utf-8")).hexdigest()
+    b = hashlib.sha256(expected.encode("utf-8")).hexdigest()
+    return secrets.compare_digest(a, b)
+
+
+def _purge_cooldown_remaining() -> int:
+    ip = client_ip()
+    now = time.monotonic()
+    with _purge_cooldown_lock:
+        until = float(_purge_cooldown_until.get(ip) or 0)
+        left = int(round(until - now))
+        if left <= 0:
+            _purge_cooldown_until.pop(ip, None)
+            return 0
+        return left
+
+
+def _mark_purge_cooldown() -> None:
+    ip = client_ip()
+    with _purge_cooldown_lock:
+        _purge_cooldown_until[ip] = time.monotonic() + float(IPTV_ADMIN_PURGE_COOLDOWN_SEC)
 
 
 @app.route("/admin/backup")
 def admin_backup():
     """Download a SQLite backup (optional token via IPTV_PLAYLIST_SECRET)."""
-    if IPTV_PLAYLIST_SECRET and request.args.get("token") != IPTV_PLAYLIST_SECRET:
+    if not _playlist_token_ok():
         abort(403)
     try:
         from features.storage.db import get_default_store
         path = get_default_store().backup()
         return send_file(path, as_attachment=True, download_name=os.path.basename(path))
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/admin/purge", methods=["POST"])
+def admin_purge():
+    """Purge the channel catalog and enqueue a fresh ingest + health pass.
+
+    Requires ``IPTV_ADMIN_PASSWORD`` (or ``IPTV_PLAYLIST_SECRET`` fallback) as
+    JSON/form ``password`` (aliases: ``token``, header ``X-Admin-Password``).
+    Loopback alone is **not** enough — reverse proxies make every client look
+    local. Also rate-limited and cooled down after a successful wipe.
+    Body ``confirm=purge`` is required.
+    """
+    limited = check_admin_purge_rate_limit()
+    if limited is not None:
+        return limited
+
+    cooldown = _purge_cooldown_remaining()
+    if cooldown > 0:
+        resp = jsonify({
+            "ok": False,
+            "error": "purge_cooldown",
+            "message": f"Purge was just used. Try again in about {cooldown} seconds.",
+            "retry_after": cooldown,
+        })
+        resp.status_code = 429
+        resp.headers["Retry-After"] = str(cooldown)
+        return resp
+
+    if not _purge_password_configured():
+        return jsonify({
+            "ok": False,
+            "error": "admin_password_not_configured",
+            "message": (
+                "HTTP purge is disabled until you set IPTV_ADMIN_PASSWORD "
+                "(or IPTV_PLAYLIST_SECRET). Use the startup menu / CLI to wipe locally."
+            ),
+        }), 503
+
+    payload = request.get_json(silent=True) if request.is_json else {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    if not _purge_password_ok(_extract_admin_password(payload)):
+        return jsonify({
+            "ok": False,
+            "error": "invalid_password",
+            "message": "Admin password required.",
+        }), 403
+
+    confirm = (
+        str(payload.get("confirm") or request.args.get("confirm") or request.form.get("confirm") or "")
+        .strip()
+        .lower()
+    )
+    if confirm != "purge":
+        return jsonify({
+            "error": "confirmation required",
+            "hint": 'POST JSON {"confirm":"purge","password":"…"}',
+        }), 400
+
+    clear_geo = str(
+        payload.get("clear_geo") or request.args.get("clear_geo") or ""
+    ).lower() in ("1", "true", "yes")
+
+    try:
+        from features.storage.db import get_default_store
+        from features.workers import fw_tasks
+        from config import FILES
+
+        store = get_default_store()
+        before = store.count_channels(exclude_test=False)
+        summary = store.purge_catalog(keep_host_geo=not clear_geo)
+
+        for key in ("streams", "dead", "invalid", "master"):
+            path = FILES.get(key)
+            if not path:
+                continue
+            try:
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("[]\n")
+            except OSError:
+                pass
+        try:
+            with open(os.path.join("jsons", "SEO_SLUG_MANIFEST.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"slug_order":[],"slugs":{}}\n')
+        except OSError:
+            pass
+        try:
+            from features.seo import seo as seo_mod
+            seo_mod._seo_slug_to_channel = {}
+            seo_mod._seo_slugs_sorted = []
+            seo_mod._seo_slug_revision = -1
+        except Exception:
+            pass
+
+        fw_tasks.REQUEST_FRESH_INGEST = True
+        ok_ingest = fw_tasks.enqueue("ingest_sources")
+        ok_health = fw_tasks.enqueue("active_health_batch")
+        state.SCAN_ACTIVE = True
+        _mark_purge_cooldown()
+        return jsonify({
+            "ok": True,
+            "purged_channels": summary.get("channels", before),
+            "revision": summary.get("revision"),
+            "ingest_queued": bool(ok_ingest),
+            "health_queued": bool(ok_health),
+            "cooldown_seconds": IPTV_ADMIN_PURGE_COOLDOWN_SEC,
+            "message": "Catalog purged; fresh ingest queued.",
+        })
+    except Exception as e:
+        logging.error("admin purge failed: %s", e, exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 

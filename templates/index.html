@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#050812">
+    <meta name="color-scheme" content="dark">
+
+    <!-- Homepage SEO -->
+    <title>Live TV Guide — Free IPTV Channels &amp; Streams</title>
+    <meta name="description" content="Free live TV guide: browse and watch thousands of IPTV channels — news, sports, movies and music — right from your browser.">
+    <link rel="canonical" href="{{ request.url_root }}">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="Live TV Guide">
+    <meta property="og:title" content="Live TV Guide — Free IPTV Channels &amp; Streams">
+    <meta property="og:description" content="Browse and watch live IPTV channels from around the world.">
+    <meta property="og:url" content="{{ request.url_root }}">
+    <meta property="og:image" content="{{ url_for('static', filename='og-image.svg', _external=True) }}">
+    <meta property="og:image:type" content="image/svg+xml">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Live TV Guide">
+    <meta name="twitter:description" content="Browse and watch live IPTV channels from around the world.">
+    <meta name="twitter:image" content="{{ url_for('static', filename='og-image.svg', _external=True) }}">
+
+    <!-- PWA / icons -->
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+    <!-- Feeds -->
+    <link rel="alternate" type="application/rss+xml" title="IPTV Scanner — channel feed" href="/feed.xml">
+    <link rel="alternate" type="application/atom+xml" title="IPTV Scanner — channel feed" href="/atom.xml">
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Lexend:wght@500;600;700;800&display=swap" rel="stylesheet">
+
+    <!-- Tailwind (CDN) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['DM Sans', 'system-ui', 'sans-serif'],
+                        display: ['Lexend', 'system-ui', 'sans-serif'],
+                    },
+                    colors: {
+                        ink: {
+                            950: '#020409',
+                            900: '#050812',
+                            800: '#0a1020',
+                            700: '#111a30',
+                            600: '#1a2540',
+                        },
+                        brand: {
+                            50: '#e6f3ff',
+                            100: '#bfe0ff',
+                            200: '#89c7ff',
+                            300: '#4fadff',
+                            400: '#2d9dff',
+                            500: '#1487ea',
+                            600: '#0a6ecb',
+                            700: '#0855a1',
+                        },
+                    },
+                    boxShadow: {
+                        glow: '0 0 0 1px rgba(45,157,255,.35), 0 8px 32px rgba(45,157,255,.18)',
+                    },
+                },
+            },
+        };
+    </script>
+
+    <!-- App styles (rails, nav, player chrome, tiles) -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}?v=9">
+</head>
+
+<body class="min-h-screen bg-ink-900 text-slate-100 font-sans antialiased selection:bg-brand-400/40">
+    <a href="#viewBody" class="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-[100] focus:rounded-lg focus:bg-brand-400 focus:px-3 focus:py-2 focus:text-ink-950">Skip to channels</a>
+
+    <!-- ============ Left nav (desktop, lg+) ============ -->
+    <aside id="sideNav" class="side-nav hidden lg:flex" aria-label="Primary">
+        <a href="/" class="side-brand" aria-label="Live TV Guide home">
+            <span class="side-brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24" class="h-5 w-5" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+            </span>
+            <span class="flex flex-col leading-tight">
+                <span class="font-display text-base font-semibold tracking-tight">Live TV Guide</span>
+                <span class="text-[11px] text-slate-400">All your channels</span>
+            </span>
+        </a>
+
+        <nav class="mt-4 flex flex-1 flex-col gap-1" aria-label="Sections">
+            <button type="button" class="nav-item" data-nav="search">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+                <span>Search</span>
+            </button>
+            <button type="button" class="nav-item" data-nav="home">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>
+                <span>Home <span class="text-slate-500 font-normal">· Live</span></span>
+            </button>
+            <button type="button" class="nav-item" data-nav="categories">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5"/></svg>
+                <span>Categories</span>
+            </button>
+            <button type="button" class="nav-item" data-nav="servers">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01" stroke-linecap="round"/></svg>
+                <span>Servers</span>
+            </button>
+            <button type="button" class="nav-item" data-nav="favorites">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M12 17.3 6.2 21l1.5-6.6L2.5 9.9l6.7-.6L12 3l2.8 6.3 6.7.6-5.2 4.5L17.8 21z"/></svg>
+                <span>My list</span>
+            </button>
+            <button type="button" class="nav-item" data-nav="videos">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="m10 9.5 5 2.5-5 2.5z" fill="currentColor"/></svg>
+                <span>Videos</span>
+            </button>
+            <button type="button" class="nav-item mt-auto" data-nav="more" aria-haspopup="dialog" aria-controls="moreSheet">
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
+                <span>More</span>
+            </button>
+        </nav>
+
+        <div class="side-stats" aria-live="polite">
+            <div class="flex items-center justify-between"><span class="inline-flex items-center gap-1.5"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>Live</span><strong class="tabular-nums text-slate-100" data-stat="online">0</strong></div>
+            <div class="flex items-center justify-between"><span class="inline-flex items-center gap-1.5"><span class="h-1.5 w-1.5 rounded-full bg-amber-400"></span>Pending</span><strong class="tabular-nums text-slate-100" data-stat="pending">0</strong></div>
+            <div class="text-[11px] text-slate-500" data-stat="scan">Ready</div>
+        </div>
+    </aside>
+
+    <div class="app-shell">
+        <!-- ============ Sticky player dock ============ -->
+        <section id="playerDock" class="player-dock" aria-label="Player">
+            <div class="dock-inner">
+                <div id="videoPlayer" class="video-wrap is-empty is-paused">
+                    <div id="videoMount" class="absolute inset-0"></div>
+
+                    <!-- Empty state -->
+                    <div id="playerPlaceholder" class="player-layer grid place-items-center text-center p-4">
+                        <div class="max-w-xs">
+                            <div class="mx-auto mb-2 grid h-12 w-12 place-items-center rounded-full bg-brand-400/15 ring-1 ring-brand-400/30 text-brand-300">
+                                <svg viewBox="0 0 24 24" class="h-6 w-6" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                            </div>
+                            <p class="font-display text-sm sm:text-base font-semibold text-slate-100">Pick a channel to start</p>
+                            <p class="text-xs text-slate-400 mt-0.5">Tap any tile below.</p>
+                        </div>
+                    </div>
+
+                    <!-- Spinner / error / audio-only -->
+                    <div id="playerSpinner" class="player-layer grid place-items-center pointer-events-none hidden"><span class="spinner" role="status" aria-label="Loading stream"></span></div>
+                    <div id="playerError" class="player-layer grid place-items-center text-center p-4 bg-black/70 hidden" role="alert">
+                        <div class="max-w-xs">
+                            <p id="playerErrorText" class="text-sm font-medium text-slate-100">This stream isn't responding.</p>
+                            <div class="mt-3 flex justify-center gap-2">
+                                <button type="button" data-player-action="retry" class="rounded-full bg-brand-400 px-3.5 py-1.5 text-sm font-semibold text-ink-950 hover:bg-brand-300">Retry</button>
+                                <button type="button" data-player-action="next" class="rounded-full bg-white/10 px-3.5 py-1.5 text-sm font-medium text-slate-100 hover:bg-white/15">Next channel</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="audioOnlyBadge" class="player-layer grid place-items-center pointer-events-none bg-gradient-to-b from-ink-900/40 to-ink-950/80 hidden">
+                        <div class="text-center px-4">
+                            <div class="mx-auto mb-2 grid h-12 w-12 place-items-center rounded-full bg-brand-400/15 ring-1 ring-brand-400/30 text-brand-300">
+                                <svg viewBox="0 0 24 24" class="h-6 w-6" fill="currentColor" aria-hidden="true"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg>
+                            </div>
+                            <p class="font-display text-sm font-semibold text-slate-100">Audio stream</p>
+                        </div>
+                    </div>
+
+                    <!-- Always-visible badges -->
+                    <div class="player-badges">
+                        <span id="insecureBadge" class="badge badge-warn hidden" title="This stream is not encrypted (HTTP)">
+                            <svg viewBox="0 0 24 24" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 2 21h20z"/><path d="M12 10v5M12 18h.01"/></svg>
+                            Insecure
+                        </span>
+                        <span id="viewersBadge" class="badge hidden" title="People watching this channel now">
+                            <svg viewBox="0 0 24 24" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+                            <span id="viewersCount">0</span> watching
+                        </span>
+                    </div>
+
+                    <!-- Tap layer + custom chrome (native controls are disabled) -->
+                    <button type="button" id="playerTap" class="player-tap" aria-label="Show player controls"></button>
+                    <button type="button" id="chromeCenterPlay" data-player-action="toggle-play" class="chrome-center" aria-label="Play">
+                        <svg viewBox="0 0 24 24" class="h-8 w-8" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+                    </button>
+
+                    <div id="playerChrome" class="player-chrome">
+                        <div class="chrome-top">
+                            <p id="chromeTitle" class="truncate text-sm font-semibold text-white drop-shadow">No channel selected</p>
+                        </div>
+                        <div class="chrome-bottom">
+                            <button type="button" class="chrome-btn" data-player-action="prev" aria-label="Previous channel" title="Previous channel (P)">
+                                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 6h2v12H6zm3.5 6L18 18V6z"/></svg>
+                            </button>
+                            <button type="button" id="chromePlay" class="chrome-btn chrome-btn-lg" data-player-action="toggle-play" aria-label="Play / pause" title="Play / pause (Space)">
+                                <svg data-show="paused" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+                                <svg data-show="playing" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 5h4v14H6zm8 0h4v14h-4z"/></svg>
+                            </button>
+                            <button type="button" class="chrome-btn" data-player-action="next" aria-label="Next channel" title="Next channel (N)">
+                                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16 6h2v12h-2zM6 18l8.5-6L6 6z"/></svg>
+                            </button>
+                            <button type="button" class="chrome-btn" data-player-action="toggle-mute" aria-label="Mute / unmute" title="Mute (M)">
+                                <svg data-show="unmuted" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 10v4h4l5 4V6L7 10zm13.5 2A4.5 4.5 0 0 0 14 8v8a4.5 4.5 0 0 0 2.5-4z"/></svg>
+                                <svg data-show="muted" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 10v4h4l5 4V6L7 10zm12.6 2 2.7-2.7-1.4-1.4-2.7 2.7-2.7-2.7-1.4 1.4 2.7 2.7-2.7 2.7 1.4 1.4 2.7-2.7 2.7 2.7 1.4-1.4z"/></svg>
+                            </button>
+                            <span class="flex-1"></span>
+                            <label class="chrome-quality">
+                                <span class="sr-only">Video quality</span>
+                                <select id="qualitySelect" disabled>
+                                    <option value="-1">Auto</option>
+                                </select>
+                            </label>
+                            <button type="button" class="chrome-btn" data-player-action="fullscreen" aria-label="Fullscreen" title="Fullscreen (F)">
+                                <svg data-show="fs-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+                                <svg data-show="fs-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Now playing -->
+                <div class="dock-info">
+                    <div class="min-w-0">
+                        <div class="flex items-center gap-2 text-[11px] uppercase tracking-widest text-brand-300/80 font-semibold">
+                            <span class="inline-flex items-center gap-1"><span id="liveDot" class="h-1.5 w-1.5 rounded-full bg-slate-500"></span>Now playing</span>
+                        </div>
+                        <h2 id="currentChannelName" class="font-display text-base sm:text-lg font-semibold truncate">No channel selected</h2>
+                        <p id="currentChannelInfo" class="text-xs sm:text-sm text-slate-400 truncate">Choose from the rails below.</p>
+                    </div>
+                    <div class="dock-actions">
+                        <button type="button" class="dock-btn" data-player-action="prev" aria-label="Previous channel">
+                            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 6h2v12H6zm3.5 6L18 18V6z"/></svg>
+                            <span class="hidden xl:inline">Prev</span>
+                        </button>
+                        <button type="button" class="dock-btn" data-player-action="next" aria-label="Next channel">
+                            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16 6h2v12h-2zM6 18l8.5-6L6 6z"/></svg>
+                            <span class="hidden xl:inline">Next</span>
+                        </button>
+                        <button type="button" id="dockFav" class="dock-btn" data-player-action="fav" aria-pressed="false" aria-label="Add to My list">
+                            <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M12 17.3 6.2 21l1.5-6.6L2.5 9.9l6.7-.6L12 3l2.8 6.3 6.7.6-5.2 4.5L17.8 21z"/></svg>
+                            <span class="hidden xl:inline">My list</span>
+                        </button>
+                        <button type="button" class="dock-btn" data-player-action="copy" aria-label="Copy stream link" title="Copy stream link">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>
+                            <span class="hidden xl:inline">Copy link</span>
+                        </button>
+                        <button type="button" class="dock-btn" data-player-action="vlc" aria-label="Open in VLC" title="Open in VLC">
+                            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 3 4 20h16z"/></svg>
+                            <span class="hidden xl:inline">VLC</span>
+                        </button>
+                        <button type="button" id="miniToggle" class="dock-btn" data-player-action="mini" aria-pressed="false" aria-label="Shrink player" title="Shrink / grow player">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ============ Main (rails) ============ -->
+        <main class="app-main">
+            <div class="toolbar">
+                <label class="relative min-w-0 flex-1">
+                    <span class="sr-only">Search channels</span>
+                    <svg class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+                    <input id="searchInput" type="search" inputmode="search" autocomplete="off" enterkeyhint="search"
+                           placeholder="Search channels…  ( / )"
+                           class="h-10 w-full rounded-full border border-white/10 bg-ink-800/80 pl-9 pr-4 text-sm text-slate-100 placeholder:text-slate-500 transition focus:border-brand-400/60 focus:outline-none focus:ring-2 focus:ring-brand-400/25">
+                </label>
+                <label id="sortWrap" class="hidden shrink-0">
+                    <span class="sr-only">Sort channels</span>
+                    <select id="sortFilter" class="h-10 rounded-full border border-white/10 bg-ink-800/80 px-3 text-sm text-slate-200 focus:border-brand-400/60 focus:outline-none focus:ring-2 focus:ring-brand-400/25">
+                        <option value="trending" selected>Trending</option>
+                        <option value="name">Name</option>
+                        <option value="server">Server</option>
+                        <option value="group">Category</option>
+                    </select>
+                </label>
+                <div class="status-pill hidden sm:inline-flex" aria-live="polite">
+                    <span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
+                    <span><strong data-stat="online">0</strong> live</span>
+                    <span class="text-slate-600">·</span>
+                    <span><strong data-stat="pending">0</strong> pending</span>
+                </div>
+            </div>
+
+            <div class="view-head">
+                <button type="button" id="viewBack" class="view-back hidden" aria-label="Back">
+                    <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 6-6 6 6 6"/></svg>
+                </button>
+                <div class="min-w-0">
+                    <h1 id="viewTitle" class="font-display text-xl sm:text-2xl font-semibold tracking-tight truncate">Live TV</h1>
+                    <p id="viewSub" class="text-xs sm:text-sm text-slate-400 truncate"></p>
+                </div>
+            </div>
+
+            <div id="viewBody" class="view-body" aria-live="polite" aria-busy="true"></div>
+        </main>
+    </div>
+
+    <!-- ============ Bottom tab bar (mobile / tablet, < lg) ============ -->
+    <nav id="bottomNav" class="bottom-nav lg:hidden" aria-label="Primary">
+        <button type="button" class="tab-item" data-nav="home">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>
+            <span>Home</span>
+        </button>
+        <button type="button" class="tab-item" data-nav="categories">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5"/></svg>
+            <span>Categories</span>
+        </button>
+        <button type="button" class="tab-item" data-nav="servers">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01" stroke-linecap="round"/></svg>
+            <span>Servers</span>
+        </button>
+        <button type="button" class="tab-item" data-nav="search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <span>Search</span>
+        </button>
+        <button type="button" class="tab-item" data-nav="favorites">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M12 17.3 6.2 21l1.5-6.6L2.5 9.9l6.7-.6L12 3l2.8 6.3 6.7.6-5.2 4.5L17.8 21z"/></svg>
+            <span>My list</span>
+        </button>
+        <button type="button" class="tab-item" data-nav="more" aria-haspopup="dialog" aria-controls="moreSheet">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
+            <span>More</span>
+        </button>
+    </nav>
+
+    <!-- Toasts -->
+    <div id="notifyHost" class="notify-host" aria-live="polite"></div>
+
+    <!-- Hidden selects: data source for category / server filters (JS keeps them in sync) -->
+    <div class="sr-only" aria-hidden="true">
+        <select id="groupFilter" tabindex="-1"><option value="">All categories</option></select>
+        <select id="countryFilter" tabindex="-1"><option value="">All servers</option></select>
+    </div>
+
+    <!-- ============ More sheet ============ -->
+    <div id="moreSheet" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="moreTitle" aria-hidden="true">
+        <button type="button" class="modal-backdrop" data-modal-dismiss aria-label="Close"></button>
+        <div class="modal-panel modal-sheet">
+            <div class="mx-auto mb-2 h-1 w-10 rounded-full bg-white/20 sm:hidden"></div>
+            <div class="flex items-center justify-between gap-2">
+                <h2 id="moreTitle" class="font-display text-lg font-semibold">More</h2>
+                <button type="button" data-modal-dismiss class="grid h-10 w-10 place-items-center rounded-full text-slate-300 hover:bg-white/5" aria-label="Close">
+                    <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                </button>
+            </div>
+
+            <div class="mt-3 space-y-1">
+                <button type="button" data-nav="videos" data-modal-dismiss class="more-row lg:hidden">
+                    <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="m10 9.5 5 2.5-5 2.5z" fill="currentColor"/></svg>
+                    Videos (on-demand)
+                </button>
+                <label class="more-row cursor-pointer">
+                    <input id="pendingToggle" type="checkbox" class="h-4 w-4 accent-brand-400">
+                    <span class="flex-1">Show pending / offline streams
+                        <span class="block text-xs text-slate-500">Unchecked streams may not load. If one plays, it gets promoted for everyone.</span></span>
+                </label>
+                <label class="more-row cursor-pointer">
+                    <input id="testToggle" type="checkbox" class="h-4 w-4 accent-brand-400">
+                    <span>Include test / beta channels</span>
+                </label>
+            </div>
+
+            <div class="mt-4 rounded-xl border border-white/10 bg-ink-900/70 p-3 text-sm">
+                <div class="mb-2 flex items-center justify-between text-xs text-slate-400">
+                    <span class="inline-flex items-center gap-1.5"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span><strong class="text-slate-100 tabular-nums" data-stat="online">0</strong> live</span>
+                    <span class="inline-flex items-center gap-1.5"><span class="h-1.5 w-1.5 rounded-full bg-amber-400"></span><strong class="text-slate-100 tabular-nums" data-stat="pending">0</strong> pending</span>
+                    <span data-stat="scan">Ready</span>
+                </div>
+                <div class="text-xs font-semibold text-slate-300">Jellyfin / VLC playlist (M3U)</div>
+                <code id="jellyfinM3u" class="mt-1 block truncate rounded bg-ink-950 px-2 py-1 text-[11px] text-slate-300">—</code>
+                <button type="button" id="copyM3uBtn" class="mt-2 inline-flex items-center gap-1.5 rounded-md bg-brand-400/15 px-2.5 py-1 text-xs font-medium text-brand-200 ring-1 ring-brand-400/30 hover:bg-brand-400/25">Copy playlist link</button>
+            </div>
+
+            <div class="mt-4 rounded-xl border border-rose-400/20 bg-rose-950/30 p-3 text-sm">
+                <div class="text-xs font-semibold text-rose-200">Catalog maintenance</div>
+                <p class="mt-1 text-xs text-slate-400">Wipe stored channels and pull playlists again. Requires the admin password (<code class="text-slate-300">IPTV_ADMIN_PASSWORD</code>). Rate-limited.</p>
+                <label class="mt-2 block text-xs text-slate-400" for="purgePassword">Admin password</label>
+                <input id="purgePassword" type="password" autocomplete="current-password" placeholder="Required"
+                    class="mt-1 w-full rounded-md border border-white/10 bg-ink-950 px-2.5 py-1.5 text-sm text-slate-100 placeholder:text-slate-600 focus:border-rose-400/40 focus:outline-none">
+                <button type="button" id="purgeRescanBtn" class="mt-2 inline-flex items-center gap-1.5 rounded-md bg-rose-400/15 px-2.5 py-1.5 text-xs font-medium text-rose-100 ring-1 ring-rose-400/30 hover:bg-rose-400/25">
+                    Purge old data &amp; fetch fresh
+                </button>
+            </div>
+
+            <div class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-sm">
+                <a class="text-brand-300 underline underline-offset-2 hover:text-brand-200" href="/api">API &amp; integrations</a>
+                <span class="text-slate-600">·</span>
+                <a class="text-brand-300 underline underline-offset-2 hover:text-brand-200" href="/api/playground">API playground</a>
+                <a class="text-brand-300 underline underline-offset-2 hover:text-brand-200" href="/openapi.yaml">OpenAPI</a>
+                <a class="text-brand-300 underline underline-offset-2 hover:text-brand-200" href="/feed.xml">RSS</a>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ Insecure stream confirm ============ -->
+    <div id="insecureModal" class="modal hidden" role="alertdialog" aria-modal="true" aria-labelledby="insecureTitle" aria-describedby="insecureDesc" aria-hidden="true">
+        <button type="button" class="modal-backdrop" data-insecure-cancel aria-label="Cancel"></button>
+        <div class="modal-panel modal-dialog">
+            <div class="flex items-start gap-3">
+                <span class="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-amber-400/15 text-amber-300 ring-1 ring-amber-400/30">
+                    <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 2 21h20z"/><path d="M12 10v5M12 18h.01"/></svg>
+                </span>
+                <div class="min-w-0">
+                    <h2 id="insecureTitle" class="font-display text-lg font-semibold">This stream isn't encrypted</h2>
+                    <p id="insecureDesc" class="mt-1 text-sm text-slate-300">
+                        <span id="insecureHost" class="font-semibold text-slate-100 break-all">This server</span> sends video over plain HTTP.
+                        We'll play it through our proxy, but the source can't be verified. Continue?
+                    </p>
+                    <p class="mt-1 text-xs text-slate-500">We'll only ask once per browser session.</p>
+                </div>
+            </div>
+            <div class="mt-4 flex justify-end gap-2">
+                <button type="button" id="insecureCancel" data-insecure-cancel class="rounded-full bg-white/10 px-4 py-2 text-sm font-medium text-slate-100 hover:bg-white/15">Cancel</button>
+                <button type="button" id="insecureContinue" class="rounded-full bg-brand-400 px-4 py-2 text-sm font-semibold text-ink-950 hover:bg-brand-300">Continue</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.6.16/hls.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script src="{{ url_for('static', filename='js/scripts.js') }}?v=15"></script>
+
+    <!-- SW registration -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js').catch(() => {});
+            });
+        }
+    </script>
+</body>
+</html>

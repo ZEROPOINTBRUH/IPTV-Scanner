@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#050812">
+    <title>Public API — {{ site_name }}</title>
+    <meta name="description" content="Free, no-key channel API: one JSON endpoint, M3U playlists, and quick setup for Jellyfin, Plex, Emby, VLC and game loaders.">
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Lexend:wght@600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['DM Sans', 'system-ui', 'sans-serif'],
+                        display: ['Lexend', 'system-ui', 'sans-serif'],
+                    },
+                    colors: {
+                        ink: { 950: '#020409', 900: '#050812', 800: '#0a1020', 700: '#111a30' },
+                        brand: { 200: '#89c7ff', 300: '#4fadff', 400: '#2d9dff' },
+                    },
+                },
+            },
+        };
+    </script>
+    <style>
+        code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+        pre { overflow-x: auto; }
+        :target { scroll-margin-top: 1rem; }
+    </style>
+</head>
+<body class="min-h-screen bg-ink-900 text-slate-100 font-sans antialiased">
+    <main class="mx-auto max-w-3xl px-4 py-8 sm:py-12">
+
+        <nav class="mb-6 flex flex-wrap items-center justify-between gap-2 text-sm">
+            <a href="/" class="inline-flex items-center gap-1.5 text-brand-300 hover:text-brand-200">&larr; Live TV Guide</a>
+            <span class="flex flex-wrap gap-x-3 text-slate-400">
+                <a class="text-brand-300 hover:text-brand-200" href="/api/playground">Playground</a>
+                <a class="hover:text-slate-200" href="#start">Start</a>
+                <a class="hover:text-slate-200" href="#examples">Examples</a>
+                <a class="hover:text-slate-200" href="#formats">Formats</a>
+                <a class="hover:text-slate-200" href="#platforms">Platforms</a>
+                <a class="hover:text-slate-200" href="#limits">Limits</a>
+                <a class="hover:text-slate-200" href="#reports">Reports</a>
+            </span>
+        </nav>
+
+        <header class="mb-8">
+            <h1 class="font-display text-3xl sm:text-4xl font-bold tracking-tight">{{ site_name }} API</h1>
+            <p class="mt-2 text-slate-300 leading-relaxed">
+                Free and public. <strong>No API key.</strong> Plain <code class="text-brand-300">GET</code> returns one page of up to
+                {{ page_size }} channels. Serving from <code class="text-brand-300">{{ base_url or '(this host)' }}</code>.
+            </p>
+            <a href="/api/playground"
+               class="mt-4 inline-flex items-center gap-2 rounded-xl bg-brand-400/15 px-4 py-2.5 text-sm font-semibold text-brand-200 ring-1 ring-brand-400/35 hover:bg-brand-400/25">
+                Open API Playground
+                <span aria-hidden="true">&rarr;</span>
+            </a>
+        </header>
+
+        <!-- 1. Start here -->
+        <section id="start" class="mb-10">
+            <h2 class="font-display text-xl font-semibold mb-1"><span class="text-brand-300">1.</span> Start here</h2>
+            <p class="text-slate-400 text-sm mb-3"><code class="text-brand-300">GET /api/v1/channels</code> &mdash; everything else is a variation of this.</p>
+
+            <div class="rounded-xl border border-white/10 bg-ink-800/70 overflow-hidden">
+                <table class="w-full text-sm">
+                    <thead class="bg-black/30 text-left text-xs uppercase tracking-wide text-slate-400">
+                        <tr><th class="px-3 py-2 font-medium">Param</th><th class="px-3 py-2 font-medium">What it does</th></tr>
+                    </thead>
+                    <tbody class="divide-y divide-white/5 text-slate-300">
+                        <tr><td class="px-3 py-2 align-top"><code class="text-brand-300">page</code>, <code class="text-brand-300">limit</code></td><td class="px-3 py-2">Page number (from 1) and rows per page (default {{ page_size }}).</td></tr>
+                        <tr><td class="px-3 py-2 align-top"><code class="text-brand-300">q</code></td><td class="px-3 py-2">Search by channel name.</td></tr>
+                        <tr><td class="px-3 py-2 align-top"><code class="text-brand-300">group</code></td><td class="px-3 py-2">Category, e.g. <code>News</code>. Comma-separate for several (<code>News,Sports</code> = OR).</td></tr>
+                        <tr><td class="px-3 py-2 align-top"><code class="text-brand-300">server</code></td><td class="px-3 py-2">Stream host country (e.g. <code>US</code>). <code>country</code> alias. Comma-separate for several.</td></tr>
+                        <tr><td class="px-3 py-2 align-top"><code class="text-brand-300">sort</code></td><td class="px-3 py-2"><code>trending</code> (default), <code>name</code>, <code>server</code>, <code>group</code>, <code>scanned</code> / <code>last_checked_at</code>.</td></tr>
+                        <tr><td class="px-3 py-2 align-top"><code class="text-brand-300">sort_dir</code></td><td class="px-3 py-2"><code>asc</code> or <code>desc</code>. Defaults to <code>desc</code> for trending / scanned.</td></tr>
+                        <tr><td class="px-3 py-2 align-top"><code class="text-brand-300">status</code></td><td class="px-3 py-2"><code>online</code> (default), <code>offline</code>, <code>unchecked</code>, <code>dead</code>, or <code>all</code>. Combines with <code>group</code> / <code>q</code> / <code>server</code> (non-online may not load).</td></tr>
+                        <tr><td class="px-3 py-2 align-top"><code class="text-brand-300">media_type</code></td><td class="px-3 py-2"><code>live</code> (default) or <code>vod</code>.</td></tr>
+                        <tr><td class="px-3 py-2 align-top"><code class="text-brand-300">include=facets</code></td><td class="px-3 py-2">Adds category and server lists so you know valid <code>group</code> / <code>server</code> values.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <h3 class="mt-4 mb-1.5 text-xs uppercase tracking-wide text-slate-500">Response shape</h3>
+            <pre class="rounded-xl border border-white/10 bg-black/40 p-3 text-xs sm:text-sm text-slate-300 leading-relaxed">curl -sS "{{ base_url }}/api/v1/channels?group=News&amp;sort=trending&amp;limit=5"
+
+{
+  "ok": true,
+  "page": 1, "per_page": 5, "total": 312, "total_pages": 63,
+  "has_more": true,
+  "next_url": "{{ base_url }}/api/v1/channels?group=News&amp;limit=5&amp;page=2",
+  "wait_seconds": {{ wait_seconds }},
+  "channels": [
+    {
+      "name": "Example News",
+      "url": "https://example.com/live.m3u8",
+      "proxy_url": "{{ base_url }}/proxy/stream?url=...",
+      "logo": "{{ base_url }}/icons/example.png",
+      "generic_logo": "{{ base_url }}/static/channel-generic.svg",
+      "group": "News",
+      "server": "US",
+      "status": "online",
+      "media_type": "live",
+      "viewers": 3
+    }
+  ]
+}</pre>
+            <p class="mt-2 text-sm text-slate-400">
+                Play <code class="text-slate-200">url</code> directly, or <code class="text-slate-200">proxy_url</code> when you need same-origin / CORS-friendly HLS.
+                Use <code class="text-slate-200">logo</code> for the channel-specific icon, or <code class="text-slate-200">generic_logo</code> when listing rows that have no art.
+                Follow <code class="text-slate-200">next_url</code> until it is <code>null</code>, waiting <code>wait_seconds</code> between calls.
+            </p>
+        </section>
+
+        <!-- 1b. Specific queries -->
+        <section id="examples" class="mb-10">
+            <h2 class="font-display text-xl font-semibold mb-1"><span class="text-brand-300">2.</span> Grab specifics properly</h2>
+            <p class="text-slate-400 text-sm mb-3">
+                Every filter is optional and they <strong class="text-slate-200">all AND together</strong>.
+                Defaults are <code class="text-slate-300">status=online</code> and <code class="text-slate-300">media_type=live</code> &mdash;
+                override <code class="text-slate-300">status</code> whenever you need offline / unchecked / all.
+            </p>
+
+            <div class="space-y-3 text-sm">
+                <div class="rounded-xl border border-rose-400/25 bg-rose-950/25 p-3">
+                    <div class="font-semibold text-rose-100">Offline + category + search (stacking)</div>
+                    <p class="mt-0.5 text-xs text-slate-400">
+                        This is supported today &mdash; pass <code>status=offline</code> with <code>group</code> and/or <code>q</code> (and <code>server</code> if you want).
+                        Responses include a <code>warning</code> that these may not load.
+                    </p>
+                    <pre class="mt-2 rounded-lg border border-white/10 bg-black/40 p-3 text-xs text-slate-300 leading-relaxed"># Offline channels in News whose name matches "BBC"
+curl -sS "{{ base_url }}/api/v1/channels?status=offline&amp;group=News&amp;q=BBC&amp;limit=20"
+
+# Offline Sports on US hosts, newest scan first
+curl -sS "{{ base_url }}/api/v1/channels?status=offline&amp;group=Sports&amp;server=US&amp;sort=scanned&amp;limit=24"
+
+# Same idea as M3U
+curl -sS "{{ base_url }}/api/v1/channels.m3u?status=offline&amp;group=News&amp;q=CNN&amp;page=1" -o offline-news.m3u
+
+# Unchecked (never scanned) in a category + search
+curl -sS "{{ base_url }}/api/v1/channels?status=unchecked&amp;group=Entertainment&amp;q=TV&amp;limit=20"</pre>
+                </div>
+
+                <div class="rounded-xl border border-white/10 bg-ink-800/70 p-3">
+                    <div class="font-semibold text-slate-100">Discover valid categories &amp; servers first</div>
+                    <p class="mt-0.5 text-xs text-slate-400">Facets live under <code>.facets</code>. Use those exact <code>group</code> / <code>server</code> strings in later calls.</p>
+                    <pre class="mt-2 rounded-lg border border-white/10 bg-black/40 p-3 text-xs text-slate-300 leading-relaxed">curl -sS "{{ base_url }}/api/v1/channels?include=facets&amp;limit=1" \
+  | jq '{groups: .facets.groups[:8], servers: .facets.countries[:8]}'</pre>
+                </div>
+
+                <div class="rounded-xl border border-white/10 bg-ink-800/70 p-3">
+                    <div class="font-semibold text-slate-100">By category</div>
+                    <pre class="mt-2 rounded-lg border border-white/10 bg-black/40 p-3 text-xs text-slate-300 leading-relaxed"># Exact group-title match (use the string facets returned)
+curl -sS "{{ base_url }}/api/v1/channels?group=News&amp;sort=trending&amp;limit=20"
+
+# Page 2 of the same filter — prefer next_url from the previous response
+curl -sS "{{ base_url }}/api/v1/channels?group=News&amp;sort=trending&amp;limit=20&amp;page=2"</pre>
+                </div>
+
+                <div class="rounded-xl border border-white/10 bg-ink-800/70 p-3">
+                    <div class="font-semibold text-slate-100">By server location (host country)</div>
+                    <pre class="mt-2 rounded-lg border border-white/10 bg-black/40 p-3 text-xs text-slate-300 leading-relaxed"># ISO code — server= and country= are aliases
+curl -sS "{{ base_url }}/api/v1/channels?server=US&amp;sort=name&amp;limit=25"
+curl -sS "{{ base_url }}/api/v1/channels?country=GB&amp;group=News&amp;limit=10"</pre>
+                </div>
+
+                <div class="rounded-xl border border-white/10 bg-ink-800/70 p-3">
+                    <div class="font-semibold text-slate-100">Search by name</div>
+                    <pre class="mt-2 rounded-lg border border-white/10 bg-black/40 p-3 text-xs text-slate-300 leading-relaxed">curl -sS "{{ base_url }}/api/v1/channels?q=CNN&amp;limit=10"
+curl -sS --get "{{ base_url }}/api/v1/channels" --data-urlencode "q=Fox News" --data "limit=5"</pre>
+                </div>
+
+                <div class="rounded-xl border border-white/10 bg-ink-800/70 p-3">
+                    <div class="font-semibold text-slate-100">Recently scanned (online vs offline)</div>
+                    <p class="mt-0.5 text-xs text-slate-400"><code>sort=scanned</code> (alias of <code>last_checked_at</code>) defaults to newest first. Stack with <code>group</code> / <code>q</code> / <code>server</code>.</p>
+                    <pre class="mt-2 rounded-lg border border-white/10 bg-black/40 p-3 text-xs text-slate-300 leading-relaxed"># Just verified live
+curl -sS "{{ base_url }}/api/v1/channels?status=online&amp;sort=scanned&amp;limit=24"
+
+# Just marked offline
+curl -sS "{{ base_url }}/api/v1/channels?status=offline&amp;sort=scanned&amp;limit=24"
+
+# Offline + category + search + newest scan
+curl -sS "{{ base_url }}/api/v1/channels?status=offline&amp;group=News&amp;q=CNN&amp;sort=scanned&amp;limit=20"
+
+# Never checked yet (may not load)
+curl -sS "{{ base_url }}/api/v1/channels?status=unchecked&amp;limit=24"</pre>
+                </div>
+
+                <div class="rounded-xl border border-white/10 bg-ink-800/70 p-3">
+                    <div class="font-semibold text-slate-100">On-demand / Videos</div>
+                    <pre class="mt-2 rounded-lg border border-white/10 bg-black/40 p-3 text-xs text-slate-300 leading-relaxed">curl -sS "{{ base_url }}/api/v1/channels?media_type=vod&amp;sort=name&amp;limit=20"
+# Offline VODs in a category
+curl -sS "{{ base_url }}/api/v1/channels?status=offline&amp;media_type=vod&amp;group=Movies&amp;limit=20"</pre>
+                </div>
+
+                <div class="rounded-xl border border-white/10 bg-ink-800/70 p-3">
+                    <div class="font-semibold text-slate-100">More stacked examples</div>
+                    <pre class="mt-2 rounded-lg border border-white/10 bg-black/40 p-3 text-xs text-slate-300 leading-relaxed"># US-hosted Sports that are currently online, trending
+curl -sS "{{ base_url }}/api/v1/channels?server=US&amp;group=Sports&amp;status=online&amp;sort=trending&amp;limit=15"
+
+# Names matching "BBC" on GB servers (online by default)
+curl -sS "{{ base_url }}/api/v1/channels?q=BBC&amp;server=GB&amp;limit=10"
+
+# Everything matching a search (online + offline + pending)
+curl -sS "{{ base_url }}/api/v1/channels?status=all&amp;q=News&amp;limit=30"</pre>
+                </div>
+
+                <div class="rounded-xl border border-white/10 bg-ink-800/70 p-3">
+                    <div class="font-semibold text-slate-100">Same filters as M3U (for VLC / scripts)</div>
+                    <pre class="mt-2 rounded-lg border border-white/10 bg-black/40 p-3 text-xs text-slate-300 leading-relaxed"># One page of News as a playlist
+curl -sS "{{ base_url }}/api/v1/channels.m3u?group=News&amp;page=1&amp;limit=50" -o news.m3u
+
+# Full live lineup (no paging) for Jellyfin / Plex / Emby
+curl -sS "{{ base_url }}/api/v1/playlist.m3u" -o live.m3u
+
+# Full lineup with streams routed through this server's proxy
+curl -sS "{{ base_url }}/api/v1/playlist.m3u?proxy=1" -o live-proxy.m3u</pre>
+                </div>
+
+                <div class="rounded-xl border border-white/10 bg-ink-800/70 p-3">
+                    <div class="font-semibold text-slate-100">JavaScript: page until done</div>
+                    <pre class="mt-2 rounded-lg border border-white/10 bg-black/40 p-3 text-xs text-slate-300 leading-relaxed">const base = "{{ base_url }}";
+let url = `${base}/api/v1/channels?group=News&sort=trending&limit=50`;
+const all = [];
+while (url) {
+  const r = await fetch(url);
+  if (r.status === 429) {
+    const wait = Number(r.headers.get("Retry-After") || 2);
+    await new Promise((res) => setTimeout(res, wait * 1000));
+    continue;
+  }
+  const data = await r.json();
+  all.push(...(data.channels || []));
+  url = data.next_url || null;
+  if (url && data.wait_seconds) {
+    await new Promise((res) => setTimeout(res, data.wait_seconds * 1000));
+  }
+}</pre>
+                </div>
+
+                <div class="rounded-xl border border-white/10 bg-ink-800/70 p-3">
+                    <div class="font-semibold text-slate-100">jq one-liners</div>
+                    <pre class="mt-2 rounded-lg border border-white/10 bg-black/40 p-3 text-xs text-slate-300 leading-relaxed"># Just names
+curl -sS "{{ base_url }}/api/v1/channels?group=News&amp;limit=10" | jq -r '.channels[].name'
+
+# Name + playable URL
+curl -sS "{{ base_url }}/api/v1/channels?server=US&amp;limit=10" \
+  | jq -r '.channels[] | "\(.name)\t\(.url)"'
+
+# Prefer proxy_url for browser players
+curl -sS "{{ base_url }}/api/v1/channels?q=CNN&amp;limit=5" \
+  | jq -r '.channels[] | "\(.name)\t\(.proxy_url)"'</pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- 3. Other ways -->
+        <section id="formats" class="mb-10">
+            <h2 class="font-display text-xl font-semibold mb-1"><span class="text-brand-300">3.</span> Other ways to get the same data</h2>
+            <p class="text-slate-400 text-sm mb-3">Same catalog, different shape. Pick whichever your client handles best.</p>
+            <ul class="space-y-2 text-sm">
+                <li class="rounded-xl border border-white/10 bg-black/30 p-3">
+                    <div class="font-semibold text-emerald-300">REST JSON</div>
+                    <code class="block break-all text-brand-300">{{ base_url }}/api/v1</code>
+                    <span class="text-slate-400">Discovery index with every endpoint and its params.</span>
+                </li>
+                <li class="rounded-xl border border-white/10 bg-black/30 p-3">
+                    <div class="font-semibold text-emerald-300">File-style JSON <span class="text-xs font-normal text-slate-500">(DB-backed, one URL per page)</span></div>
+                    <code class="block break-all text-brand-300">{{ base_url }}/streams.json</code>
+                    <code class="block break-all text-brand-300">{{ base_url }}/streams2.json &nbsp;&middot;&nbsp; /streams3.json &hellip;</code>
+                    <span class="text-slate-400">Easiest for loaders that can only fetch fixed URLs. Same rows as <code>/api/v1/channels</code>, plus a legacy <code>streams</code> key.</span>
+                </li>
+                <li class="rounded-xl border border-white/10 bg-black/30 p-3">
+                    <div class="font-semibold text-emerald-300">M3U</div>
+                    <code class="block break-all text-brand-300">{{ base_url }}/api/v1/channels.m3u?page=1</code>
+                    <code class="block break-all text-brand-300">{{ base_url }}/streams.m3u &nbsp;&middot;&nbsp; /streams2.m3u &hellip;</code>
+                    <code class="block break-all text-brand-300">{{ base_url }}/api/v1/playlist.m3u</code>
+                    <span class="text-slate-400">Paged M3U for browsing; <code>playlist.m3u</code> is the full live lineup for media servers (add <code>?proxy=1</code> to route through this server).</span>
+                </li>
+            </ul>
+            <p class="mt-3 text-xs text-slate-500">CORS is open (<code>Access-Control-Allow-Origin: *</code>); methods GET, HEAD, OPTIONS.</p>
+        </section>
+
+        <!-- 4. Platforms -->
+        <section id="platforms" class="mb-10">
+            <h2 class="font-display text-xl font-semibold mb-1"><span class="text-brand-300">4.</span> Set it up in your player</h2>
+            <p class="text-slate-400 text-sm mb-3">Only the genuinely different setups &mdash; everything else is just HTTP.</p>
+            <div class="space-y-3">
+                {% for p in platforms %}
+                <details id="integrate-{{ p.id }}" class="group rounded-xl border border-white/10 bg-ink-800/70 open:bg-ink-800">
+                    <summary class="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3">
+                        <span>
+                            <span class="block font-display font-semibold text-slate-50">{{ p.name }}</span>
+                            <span class="block text-xs text-slate-400">{{ p.tagline }}</span>
+                        </span>
+                        <svg class="h-4 w-4 shrink-0 text-slate-400 transition-transform group-open:rotate-180" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
+                    <div class="space-y-3 border-t border-white/5 px-4 py-3 text-sm">
+                        <ol class="list-decimal list-inside space-y-1.5 text-slate-300">
+                            {% for step in p.steps %}<li>{{ step }}</li>{% endfor %}
+                        </ol>
+                        {% if p.snippet %}
+                        <pre class="rounded-lg border border-white/10 bg-black/40 p-3 text-xs text-slate-300 leading-relaxed">{{ p.snippet }}</pre>
+                        {% endif %}
+                        {% if p.compliance %}
+                        <details class="text-xs text-slate-400">
+                            <summary class="cursor-pointer text-slate-300 hover:text-white">Good-citizen notes</summary>
+                            <ul class="mt-1.5 list-disc list-inside space-y-1">
+                                {% for rule in p.compliance %}<li>{{ rule }}</li>{% endfor %}
+                            </ul>
+                        </details>
+                        {% endif %}
+                        {% if p.official %}
+                        <p class="text-xs text-slate-400">
+                            Docs:
+                            {% for doc in p.official %}<a class="text-brand-300 underline underline-offset-2 hover:text-brand-200" href="{{ doc.url }}" target="_blank" rel="noopener">{{ doc.label }}</a>{% if not loop.last %} &middot; {% endif %}{% endfor %}
+                        </p>
+                        {% endif %}
+                    </div>
+                </details>
+                {% endfor %}
+            </div>
+        </section>
+
+        <!-- 5. Limits -->
+        <section id="limits" class="mb-10">
+            <h2 class="font-display text-xl font-semibold mb-1"><span class="text-brand-300">5.</span> Public, no key &mdash; with rate limits</h2>
+            <ul class="list-disc list-inside space-y-1.5 text-sm text-slate-300">
+                <li>No sign-up or key. Send a clear <code>User-Agent</code>.</li>
+                <li>Burst of about <strong>{{ burst }}</strong> requests, then roughly one every <strong>{{ wait_seconds }}s</strong>.</li>
+                <li>Too fast gets <code class="text-amber-300">HTTP 429</code> with a <code>Retry-After</code> header &mdash; wait that long and retry.</li>
+                <li>Cache pages locally; don't poll in a tight loop. VRChat's own loader allows about one fetch per 5&nbsp;s.</li>
+            </ul>
+            <p class="mt-3 text-sm">
+                Full machine-readable spec:
+                <a class="text-brand-300 underline underline-offset-2 hover:text-brand-200" href="/openapi.yaml">/openapi.yaml</a>
+            </p>
+        </section>
+
+        <!-- 6. Reports -->
+        <section id="reports" class="mb-10">
+            <h2 class="font-display text-xl font-semibold mb-1"><span class="text-brand-300">6.</span> Help keep the list fresh</h2>
+            <p class="text-slate-400 text-sm mb-3">Optional JSON <code>POST</code>s. They share a separate, gentler rate limit.</p>
+            <div class="space-y-2 text-sm">
+                <div class="rounded-xl border border-white/10 bg-black/30 p-3">
+                    <code class="text-brand-300">POST /api/v1/watching</code>
+                    <span class="text-slate-400"> &mdash; viewer heartbeat every ~20&nbsp;s while playing.</span>
+                    <pre class="mt-1.5 text-xs text-slate-300">{"url": "&lt;stream url&gt;", "session_id": "optional-stable-id"}
+&rarr; {"ok": true, "viewers": 3}</pre>
+                </div>
+                <div class="rounded-xl border border-white/10 bg-black/30 p-3">
+                    <code class="text-brand-300">POST /api/v1/report-playback</code>
+                    <span class="text-slate-400"> &mdash; tell us a stream failed or loaded slowly so it's re-checked sooner.</span>
+                    <pre class="mt-1.5 text-xs text-slate-300">{"url": "&lt;stream url&gt;", "event": "no_playback"}            // or "slow_load"
+{"url": "&lt;stream url&gt;", "event": "slow_load", "load_ms": 9400}</pre>
+                </div>
+                <div class="rounded-xl border border-white/10 bg-black/30 p-3">
+                    <code class="text-brand-300">POST /api/v1/report-alive</code>
+                    <span class="text-slate-400"> &mdash; an <em>unchecked</em> stream played for you: promote it and queue a priority check.</span>
+                    <pre class="mt-1.5 text-xs text-slate-300">{"url": "&lt;stream url&gt;"}</pre>
+                </div>
+            </div>
+        </section>
+
+        <footer class="border-t border-white/5 pt-5 text-xs text-slate-500 space-y-1.5">
+            <p>
+                {{ support_message }}
+                &middot; <a class="text-slate-400 underline" href="{{ support_kofi }}" target="_blank" rel="noopener">Ko-fi</a>
+                &middot; PayPal <code class="text-slate-400">{{ support_paypal }}</code>
+                &middot; Cash App <code class="text-slate-400">{{ support_cashapp }}</code>
+            </p>
+            <p>
+                Run your own copy: <a class="text-slate-400 underline" href="{{ self_host_tree }}" target="_blank" rel="noopener">{{ self_host_repo }}</a>
+                &middot; {{ site_name }} &middot; public API v1
+            </p>
+        </footer>
+    </main>
+
+    <script>
+        // Open the platform guide that the URL hash points at (#integrate-vlc etc.).
+        (function () {
+            function openFromHash() {
+                var m = (location.hash || '').match(/^#integrate-([\w-]+)$/);
+                if (!m) return;
+                var el = document.getElementById('integrate-' + m[1]);
+                if (el && el.tagName === 'DETAILS') { el.open = true; el.scrollIntoView({ block: 'nearest' }); }
+            }
+            window.addEventListener('hashchange', openFromHash);
+            openFromHash();
+        })();
+    </script>
+</body>
+</html>

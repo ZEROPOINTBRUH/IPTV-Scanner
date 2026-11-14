@@ -1,4 +1,9 @@
-"""Long-running background workers: initial scan, periodic sweep, icon prefetch."""
+"""LEGACY JSON-file workers — NOT used by ``main.py``.
+
+The live runtime uses SQLite + ``features.workers.health_workers`` /
+``fw_tasks``. This module remains only for historical reference and must not
+be imported from hot paths. Prefer deleting call sites over extending it.
+"""
 
 import asyncio
 import logging

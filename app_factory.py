@@ -17,22 +17,19 @@ from flask import Flask
 from flask_cors import CORS
 
 _ROOT = os.path.abspath(os.path.dirname(__file__))
-_WEBROOT = os.path.join(_ROOT, "webroot")
+_TEMPLATES = os.path.join(_ROOT, "templates")
+_STATIC = os.path.join(_ROOT, "static")
 
 # Module-level singleton so @app.route decorators in routes.py have something
 # to attach to at import time (mirroring the original monolithic main.py).
 #
-# `static_url_path=''` serves everything under webroot/ at root URLs so that
-# `webroot/js/scripts.js` maps to `/js/scripts.js`, `webroot/css/styles.css`
-# maps to `/css/styles.css`, etc. This keeps the service-worker shell cache
-# list (`/`, `/js/scripts.js`, `/css/*`) in sync with what the HTML actually
-# fetches. Explicit @app.route handlers still take priority (e.g. `/`, `/sw.js`,
-# `/manifest.webmanifest`, `/icons/<filename>`).
+# Standard Flask layout: Jinja under templates/, assets under static/
+# served at /static/... Explicit @app.route handlers still take priority.
 app = Flask(
     __name__,
-    template_folder=_WEBROOT,
-    static_folder=_WEBROOT,
-    static_url_path="",
+    template_folder=_TEMPLATES,
+    static_folder=_STATIC,
+    static_url_path="/static",
 )
 CORS(app)
 

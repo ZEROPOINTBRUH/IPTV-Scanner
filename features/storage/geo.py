@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
+import os
+import socket
+import threading
+import time
+import urllib.parse
 from typing import Optional
 
 # ISO 3166-1 alpha-2 (+ a few catalog regions) → English short name.
@@ -278,3 +284,232 @@ def resolve_country_code(channel: dict, source_url: Optional[str] = None) -> Opt
         return mapped
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Host (server) geolocation — where the stream is *served from*
+# ---------------------------------------------------------------------------
+
+_PLACEHOLDER_COUNTRIES = frozenset({"", "GLOBAL", "XX", "ZZ", "UNKNOWN", "UNDEFINED"})
+
+# Free HTTPS geo endpoint. ``{ip}`` is substituted. Both ``countryCode`` (ip-api
+# style) and ``country_code`` (ipwho.is style) responses are understood.
+GEO_API_URL = os.environ.get(
+    "IPTV_GEO_API_URL", "https://ipwho.is/{ip}?fields=success,country_code"
+).strip()
+try:
+    GEO_API_TIMEOUT_SEC = float(os.environ.get("IPTV_GEO_API_TIMEOUT_SEC", "6"))
+except (TypeError, ValueError):
+    GEO_API_TIMEOUT_SEC = 6.0
+try:
+    # ip-api.com free tier allows 45 req/min; stay comfortably below that.
+    GEO_MIN_INTERVAL_SEC = float(os.environ.get("IPTV_GEO_MIN_INTERVAL_SEC", "1.5"))
+except (TypeError, ValueError):
+    GEO_MIN_INTERVAL_SEC = 1.5
+# Transient failures (DNS / API errors) are remembered this long in memory only.
+_GEO_NEGATIVE_TTL_SEC = 15 * 60.0
+
+_host_country_cache: dict[str, str] = {}
+_host_negative_until: dict[str, float] = {}
+_ip_country_cache: dict[str, str] = {}
+_geo_cache_lock = threading.Lock()
+_geo_rate_lock = threading.Lock()
+_geo_next_slot = 0.0
+
+_PRIVATE_HOST_SUFFIXES = (".local", ".localdomain", ".internal", ".lan", ".home", ".intranet")
+
+
+def is_placeholder_country(code: Optional[str]) -> bool:
+    """True for empty / GLOBAL-style country values."""
+    return (code or "").strip().upper() in _PLACEHOLDER_COUNTRIES
+
+
+def _ip_is_public(ip_text: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return False
+    return not (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+def _extract_hostname(url: Optional[str]) -> str:
+    text = (url or "").strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = "//" + text
+    try:
+        host = urllib.parse.urlparse(text).hostname or ""
+    except ValueError:
+        return ""
+    return host.strip().strip(".").lower()
+
+
+def _acquire_geo_slot(block: bool) -> bool:
+    """Reserve the next rate-limited API slot; sleeps when ``block`` else refuses."""
+    global _geo_next_slot
+    with _geo_rate_lock:
+        now = time.monotonic()
+        wait = _geo_next_slot - now
+        if wait > 0 and not block:
+            return False
+        _geo_next_slot = max(now, _geo_next_slot) + max(0.0, GEO_MIN_INTERVAL_SEC)
+    if wait > 0:
+        time.sleep(wait)
+    return True
+
+
+def _lookup_ip_country(ip_text: str) -> Optional[str]:
+    """Query the geo API. Returns a code, ``"GLOBAL"`` (no country) or None (failure)."""
+    import requests
+
+    if not GEO_API_URL:
+        return None
+    try:
+        resp = requests.get(
+            GEO_API_URL.replace("{ip}", ip_text),
+            timeout=GEO_API_TIMEOUT_SEC,
+            headers={"Accept": "application/json"},
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    ok = data.get("success")
+    if ok is None:
+        ok = str(data.get("status") or "").lower() == "success"
+    if not ok:
+        return None
+    code = str(data.get("countryCode") or data.get("country_code") or "").strip().upper()
+    if len(code) == 2 and code.isalpha():
+        return "GB" if code == "UK" else code
+    return "GLOBAL"
+
+
+def _persistent_store(store=None):
+    if store is not None:
+        return store
+    try:
+        from . import db as _db
+
+        return _db._default_store  # peek only — never create a DB from geo
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def resolve_server_country_from_url(
+    url: Optional[str],
+    *,
+    block: bool = True,
+    allow_network: bool = True,
+    store=None,
+) -> Optional[str]:
+    """Country code of the host serving ``url`` (``"GLOBAL"`` when unknown/private).
+
+    Lookup order: in-memory cache, persistent ``host_geo`` table (when a store
+    is available), then DNS + a rate-limited HTTPS geo API call.
+
+    * ``block=False`` never sleeps for the rate limiter; when no API slot is
+      free the result is ``None`` (nothing cached) so callers can fall back.
+    * ``allow_network=False`` only consults caches and returns ``None`` on a miss.
+    * Private / loopback / link-local hosts resolve to ``"GLOBAL"`` without any
+      network call. Transient failures return ``None``.
+    """
+    host = _extract_hostname(url)
+    if not host:
+        return "GLOBAL"
+
+    ip_literal: Optional[str] = None
+    try:
+        ipaddress.ip_address(host)
+        ip_literal = host
+    except ValueError:
+        pass
+
+    if ip_literal is not None:
+        if not _ip_is_public(ip_literal):
+            return "GLOBAL"
+    elif (
+        "." not in host
+        or host == "localhost"
+        or host.endswith(_PRIVATE_HOST_SUFFIXES)
+    ):
+        return "GLOBAL"
+
+    with _geo_cache_lock:
+        cached = _host_country_cache.get(host)
+        if cached is not None:
+            return cached
+        if _host_negative_until.get(host, 0.0) > time.monotonic():
+            return None
+
+    db_store = _persistent_store(store)
+    if db_store is not None:
+        try:
+            persisted = db_store.get_host_country(host)
+        except Exception:  # noqa: BLE001
+            persisted = None
+        if persisted:
+            with _geo_cache_lock:
+                _host_country_cache[host] = persisted
+            return persisted
+
+    if not allow_network:
+        return None
+    if not _acquire_geo_slot(block):
+        return None
+
+    result: Optional[str] = None
+    if ip_literal is not None:
+        ip_text: Optional[str] = ip_literal
+    else:
+        ip_text = None
+        try:
+            infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        except (socket.gaierror, UnicodeError, OSError):
+            infos = []
+        addrs = []
+        for info in infos:
+            addr = info[4][0]
+            if addr not in addrs:
+                addrs.append(addr)
+        if addrs:
+            public = [a for a in addrs if _ip_is_public(a)]
+            if public:
+                ip_text = public[0]
+            else:
+                # Resolves only to private space → not geolocatable.
+                result = "GLOBAL"
+
+    if result is None and ip_text:
+        with _geo_cache_lock:
+            result = _ip_country_cache.get(ip_text)
+        if result is None:
+            result = _lookup_ip_country(ip_text)
+            if result is not None:
+                with _geo_cache_lock:
+                    _ip_country_cache[ip_text] = result
+
+    if result is None:
+        with _geo_cache_lock:
+            _host_negative_until[host] = time.monotonic() + _GEO_NEGATIVE_TTL_SEC
+        return None
+
+    with _geo_cache_lock:
+        _host_country_cache[host] = result
+    if db_store is not None:
+        try:
+            db_store.set_host_country(host, result)
+        except Exception:  # noqa: BLE001
+            pass
+    return result
